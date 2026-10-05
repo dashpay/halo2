@@ -502,14 +502,22 @@ use rand_core::OsRng;
 use crate::pasta::{Ep, EpAffine, Eq, EqAffine, Fp, Fq};
 
 #[cfg(test)]
+use group::{prime::PrimeCurveAffine, Curve};
+
+#[cfg(test)]
 fn assert_multiexp_matches_naive<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) {
-    let expected = coeffs
+    assert_eq!(best_multiexp(coeffs, bases), naive_multiexp(coeffs, bases));
+}
+
+/// The reference result: each term computed with the curve's own scalar
+/// multiplication, then summed.
+#[cfg(test)]
+fn naive_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
+    coeffs
         .iter()
         .zip(bases)
         .map(|(coeff, base)| *base * coeff)
-        .fold(C::Curve::identity(), |acc, val| acc + val);
-
-    assert_eq!(best_multiexp(coeffs, bases), expected);
+        .fold(C::Curve::identity(), |acc, val| acc + val)
 }
 
 #[cfg(test)]
@@ -700,6 +708,156 @@ fn test_multiexp_booth_boundaries() {
         .map(|_| EpAffine::from(Ep::random(rng)))
         .collect::<Vec<_>>();
     assert_multiexp_matches_naive(&fq_coeffs, &fq_bases);
+}
+
+/// Scalars that stress the signed-digit recoding: zero, small values, values
+/// next to every window size's digit boundaries at several window offsets,
+/// all-ones and alternating bit patterns, top-bit values, and values next to
+/// the field modulus.
+#[cfg(test)]
+fn multiexp_edge_scalars<F: PrimeField>() -> Vec<F> {
+    let pow2 = |e: usize| (0..e).fold(F::ONE, |acc, _| acc.double());
+    let mut scalars = vec![F::ZERO, F::ONE, -F::ONE, F::from(2), -F::from(2)];
+    for c in 1..=13 {
+        for shift in [0, c, 3 * c, 64, 128 - c, 250 - c] {
+            let base = pow2(shift);
+            for v in [
+                pow2(c) - F::ONE,
+                pow2(c),
+                pow2(c - 1) - F::ONE,
+                pow2(c - 1),
+                pow2(c - 1) + F::ONE,
+            ] {
+                scalars.push(v * base);
+                scalars.push(-(v * base));
+            }
+        }
+    }
+    let bits = F::NUM_BITS as usize;
+    let top = pow2(bits - 1);
+    scalars.extend([top, top - F::ONE, top + F::ONE, -top, pow2(bits - 2)]);
+    // Byte patterns over the low `bits - 1` bits, so they are always canonical.
+    let pattern_bits = bits - 1;
+    for pattern in [0xffu8, 0x80, 0x7f, 0xaa, 0x55, 0x01, 0xfe] {
+        let mut repr = F::Repr::default();
+        for (i, byte) in repr.as_mut().iter_mut().enumerate() {
+            let bit_start = i * 8;
+            if bit_start + 8 <= pattern_bits {
+                *byte = pattern;
+            } else if bit_start < pattern_bits {
+                *byte = pattern & ((1u8 << (pattern_bits - bit_start)) - 1);
+            }
+        }
+        let value = F::from_repr(repr).unwrap();
+        scalars.extend([value, -value]);
+    }
+    scalars
+}
+
+/// Bases with identities, repeated points (bucket doublings) and negated
+/// points (bucket cancellations) mixed into random points.
+#[cfg(test)]
+fn multiexp_test_bases<C: CurveAffine>(len: usize) -> Vec<C> {
+    let rng = OsRng;
+    let mut bases: Vec<C> = (0..len)
+        .map(|_| C::Curve::random(rng).to_affine())
+        .collect();
+    for i in 0..len {
+        match i % 11 {
+            4 => bases[i] = C::identity(),
+            7 => bases[i] = bases[i / 2],
+            9 => bases[i] = -bases[i / 3],
+            _ => {}
+        }
+    }
+    bases
+}
+
+/// Checks `best_multiexp` against the naive sum for many lengths, under
+/// several thread counts (which also moves the serial/parallel threshold), for
+/// a mix of random and edge-case scalars.
+#[cfg(test)]
+fn check_multiexp_sizes_and_threads<C: CurveAffine>(lengths: &[usize], thread_counts: &[usize]) {
+    let rng = OsRng;
+    let edge = multiexp_edge_scalars::<C::Scalar>();
+    let pools: Vec<_> = thread_counts
+        .iter()
+        .map(|&threads| {
+            maybe_rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+        })
+        .collect();
+
+    for (round, &len) in lengths.iter().enumerate() {
+        let bases = multiexp_test_bases::<C>(len);
+        let coeff_sets: [Vec<C::Scalar>; 4] = [
+            (0..len).map(|_| C::Scalar::random(rng)).collect(),
+            // Edge scalars at rotating offsets interleaved with random ones.
+            (0..len)
+                .map(|i| {
+                    if i % 3 == 2 {
+                        C::Scalar::random(rng)
+                    } else {
+                        edge[(i + round * 7) % edge.len()]
+                    }
+                })
+                .collect(),
+            // All scalars identical (every point lands in the same buckets).
+            vec![edge[(round * 5 + 3) % edge.len()]; len],
+            vec![C::Scalar::ZERO; len],
+        ];
+        for coeffs in coeff_sets.iter() {
+            let expected = naive_multiexp(coeffs, &bases);
+            for pool in &pools {
+                assert_eq!(
+                    pool.install(|| best_multiexp(coeffs, &bases)),
+                    expected,
+                    "len {}",
+                    len
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_multiexp_sizes_and_threads() {
+    let mut lengths: Vec<usize> = (0..=40).collect();
+    lengths.extend([
+        63, 64, 65, 127, 128, 129, 255, 256, 257, 1023, 1024, 1025, 2049,
+    ]);
+    let thread_counts = [1, 2, 3, 6, 14, 64];
+    check_multiexp_sizes_and_threads::<EqAffine>(&lengths, &thread_counts);
+    check_multiexp_sizes_and_threads::<EpAffine>(
+        &[0, 1, 2, 3, 4, 13, 31, 32, 33, 100, 2048],
+        &thread_counts,
+    );
+}
+
+#[test]
+fn test_multiexp_wide_windows() {
+    // The window size is ceil(ln n): 8 up to n = 2980, 9 from n = 2981 and 10
+    // from n = 8104. Cover the wider windows that large (e.g. batched)
+    // verifier MSMs use.
+    check_multiexp_sizes_and_threads::<EqAffine>(&[2980, 2981, 8104], &[1, 6]);
+}
+
+#[test]
+fn test_multiexp_edge_scalars() {
+    // Every edge scalar on its own, so that a wrong digit cannot be masked by
+    // the other terms of the sum.
+    let rng = OsRng;
+    let base = EqAffine::from(Eq::random(rng));
+    for scalar in multiexp_edge_scalars::<Fp>() {
+        for len in [1, 2, 4, 32, 33, 64] {
+            let coeffs = vec![scalar; len];
+            let mut bases = vec![EqAffine::identity(); len];
+            bases[len - 1] = base;
+            assert_eq!(best_multiexp(&coeffs, &bases), base * scalar);
+        }
+    }
 }
 
 #[test]
