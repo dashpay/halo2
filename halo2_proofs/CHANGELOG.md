@@ -6,6 +6,11 @@ and this project adheres to Rust's notion of
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- The prover's polynomial evaluator (used for the quotient polynomial `h(X)` and for
+  compressing lookup expressions) now compiles each expression into a de-duplicated
+  register program, simplifies it using exact identities on its shape and public
+  constants, and evaluates it four rows per instruction. Proofs are unchanged.
 
 ## [0.3.2] - 2025-12-04
 ### Added

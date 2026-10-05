@@ -273,6 +273,12 @@ impl<F: WithSmallOrderMulGroup<3>> EvaluationDomain<F> {
         poly
     }
 
+    /// The number of rows of the extended domain per row of the base domain, i.e. the
+    /// shift (in extended rows) that corresponds to a rotation by one.
+    pub(crate) fn extended_rotation_scale(&self) -> usize {
+        1 << (self.extended_k - self.k)
+    }
+
     /// Gets the specified chunk of the rotated version of this polynomial.
     ///
     /// Equivalent to:
@@ -283,6 +289,7 @@ impl<F: WithSmallOrderMulGroup<3>> EvaluationDomain<F> {
     ///     .unwrap()
     ///     .to_vec()
     /// ```
+    #[cfg(test)]
     pub(crate) fn get_chunk_of_rotated_extended(
         &self,
         poly: &Polynomial<F, ExtendedLagrangeCoeff>,
