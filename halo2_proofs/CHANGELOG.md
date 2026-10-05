@@ -6,6 +6,9 @@ and this project adheres to Rust's notion of
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- MSRV is now 1.63.0.
+- Bumped `pasta_curves` to 0.5.2 and enabled its `glv` feature.
 
 ## [0.3.2] - 2025-12-04
 ### Added

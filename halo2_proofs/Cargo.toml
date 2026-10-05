@@ -8,7 +8,7 @@ authors = [
     "Jack Grigg <jack@electriccoin.co>",
 ]
 edition = "2021"
-rust-version = "1.60"
+rust-version = "1.63"
 description = """
 Fast PLONK-based zero-knowledge proving system with no trusted setup
 """
@@ -52,7 +52,7 @@ backtrace = { version = "0.3", optional = true }
 ff = "0.13"
 group = "0.13"
 indexmap = "1"
-pasta_curves = "0.5"
+pasta_curves = { version = "0.5.2", features = ["glv"] }
 rand_core = { version = "0.6", default-features = false }
 tracing = "0.1"
 blake2b_simd = "1"
