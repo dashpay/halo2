@@ -6,6 +6,41 @@ and this project adheres to Rust's notion of
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.5.0] - 2026-06-02
+
+### Added
+- `halo2_gadgets::ecc`:
+  - `CircuitVersion` (re-exported from `ecc::chip`), an enum with variants
+    `AnchoredBase` and `InsecureUnanchoredBase` that selects which version of the
+    variable-base scalar-multiplication subcircuit the ECC chip synthesizes. The
+    two versions share an identical `ConstraintSystem`/`configure` and differ only
+    in witness assignment, so a single binary can build and verify against both
+    the historical and the fixed verifying keys.
+
+### Changed
+- `halo2_gadgets::ecc::chip`:
+  - `EccChip::construct` now takes a `CircuitVersion` argument (there is no
+    default). Use `CircuitVersion::AnchoredBase` for all proving and current
+    verification, and `CircuitVersion::InsecureUnanchoredBase` only to rebuild the
+    original verifying key in order to verify proofs produced by the original
+    (pre-fix) circuit.
+
+### Fixed
+- A critical soundness bug in variable-base scalar multiplication
+  (`halo2_gadgets::ecc::chip::mul`). The incomplete double-and-add loop kept the
+  per-iteration base `(x_p, y_p)` constant across its rows via `q_mul_2`, but
+  never tied it to the real base: the coordinates were written with
+  `assign_advice`, and the constancy chain reached neither the doubling-row nor
+  the complete-addition base anchors. A malicious prover could therefore run the
+  incomplete loop against a free base `B' != base`, making the gadget output
+  `[a] base + [b] B'` rather than `[scalar] base`. The base is now anchored into
+  the first incomplete-addition row via `copy_advice`, and `q_mul_2` propagates
+  the equality to every loop row. This fix changes the verifying key; see
+  `CircuitVersion` above for how to verify proofs produced before the fix.
+
+## [0.4.0] - 2025-12-04
+
 ### Added
 - `halo2_gadgets::ecc`:
   - `Point::new_from_constant`

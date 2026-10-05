@@ -238,30 +238,26 @@ impl<F: Field, S: Spec<F, WIDTH, RATE>, const WIDTH: usize, const RATE: usize>
                 // Load the initial state into this region.
                 let state = Pow5State::load(&mut region, config, initial_state)?;
 
-                let state = (0..config.half_full_rounds).fold(Ok(state), |res, r| {
-                    res.and_then(|state| state.full_round(&mut region, config, r, r))
+                let state = (0..config.half_full_rounds).try_fold(state, |state, r| {
+                    state.full_round(&mut region, config, r, r)
                 })?;
 
-                let state = (0..config.half_partial_rounds).fold(Ok(state), |res, r| {
-                    res.and_then(|state| {
-                        state.partial_round(
-                            &mut region,
-                            config,
-                            config.half_full_rounds + 2 * r,
-                            config.half_full_rounds + r,
-                        )
-                    })
+                let state = (0..config.half_partial_rounds).try_fold(state, |state, r| {
+                    state.partial_round(
+                        &mut region,
+                        config,
+                        config.half_full_rounds + 2 * r,
+                        config.half_full_rounds + r,
+                    )
                 })?;
 
-                let state = (0..config.half_full_rounds).fold(Ok(state), |res, r| {
-                    res.and_then(|state| {
-                        state.full_round(
-                            &mut region,
-                            config,
-                            config.half_full_rounds + 2 * config.half_partial_rounds + r,
-                            config.half_full_rounds + config.half_partial_rounds + r,
-                        )
-                    })
+                let state = (0..config.half_full_rounds).try_fold(state, |state, r| {
+                    state.full_round(
+                        &mut region,
+                        config,
+                        config.half_full_rounds + 2 * config.half_partial_rounds + r,
+                        config.half_full_rounds + config.half_partial_rounds + r,
+                    )
                 })?;
 
                 Ok(state.0)
@@ -448,7 +444,7 @@ impl<F: Field, const WIDTH: usize> Pow5State<F, WIDTH> {
                     .value()
                     .map(|v| *v + config.round_constants[round][idx])
             });
-            let r: Value<Vec<F>> = q.map(|q| q.map(|q| q.pow(&config.alpha))).collect();
+            let r: Value<Vec<F>> = q.map(|q| q.map(|q| q.pow(config.alpha))).collect();
             let m = &config.m_reg;
             let state = m.iter().map(|m_i| {
                 r.as_ref().map(|r| {
@@ -474,7 +470,7 @@ impl<F: Field, const WIDTH: usize> Pow5State<F, WIDTH> {
             let p: Value<Vec<_>> = self.0.iter().map(|word| word.0.value().cloned()).collect();
 
             let r: Value<Vec<_>> = p.map(|p| {
-                let r_0 = (p[0] + config.round_constants[round][0]).pow(&config.alpha);
+                let r_0 = (p[0] + config.round_constants[round][0]).pow(config.alpha);
                 let r_i = p[1..]
                     .iter()
                     .enumerate()
@@ -514,7 +510,7 @@ impl<F: Field, const WIDTH: usize> Pow5State<F, WIDTH> {
             }
 
             let r_mid: Value<Vec<_>> = p_mid.map(|p| {
-                let r_0 = (p[0] + config.round_constants[round + 1][0]).pow(&config.alpha);
+                let r_0 = (p[0] + config.round_constants[round + 1][0]).pow(config.alpha);
                 let r_i = p[1..]
                     .iter()
                     .enumerate()

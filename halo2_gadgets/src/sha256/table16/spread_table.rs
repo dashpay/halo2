@@ -298,15 +298,11 @@ mod tests {
         circuit::{Layouter, SimpleFloorPlanner, Value},
         dev::MockProver,
         pasta::Fp,
-        plonk::{Advice, Circuit, Column, ConstraintSystem, Error},
+        plonk::{Circuit, ConstraintSystem, Error},
     };
 
     #[test]
     fn lookup_table() {
-        /// This represents an advice column at a certain row in the ConstraintSystem
-        #[derive(Copy, Clone, Debug)]
-        pub struct Variable(Column<Advice>, usize);
-
         struct MyCircuit {}
 
         impl<F: PrimeField> Circuit<F> for MyCircuit {

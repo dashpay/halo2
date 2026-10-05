@@ -149,7 +149,7 @@ impl<
             chip,
             mode: Absorbing::init_empty(),
             state,
-            _marker: PhantomData::default(),
+            _marker: PhantomData,
         })
     }
 
@@ -195,7 +195,7 @@ impl<
             chip: self.chip,
             mode,
             state: self.state,
-            _marker: PhantomData::default(),
+            _marker: PhantomData,
         })
     }
 }
