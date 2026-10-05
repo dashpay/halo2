@@ -36,12 +36,16 @@ use crate::multicore::{IndexedParallelIterator, ParallelIterator};
 /// parameters `params` and the proving key [`ProvingKey`] that was
 /// generated previously for the same circuit. The provided `instances`
 /// are zero-padded internally.
+// The per-circuit stages below are collected before their results are written to
+// the transcript. With `multicore` that collect is what joins the parallel work;
+// without it the iterators are sequential and clippy considers the collect needless.
+#[cfg_attr(not(feature = "multicore"), allow(clippy::needless_collect))]
 pub fn create_proof<
     C: CurveAffine,
     E: EncodedChallenge<C>,
     R: RngCore,
     T: TranscriptWrite<C, E>,
-    ConcreteCircuit: Circuit<C::ScalarExt> + Sync,
+    ConcreteCircuit: Circuit<C::Scalar> + Sync,
 >(
     params: &Params<C>,
     pk: &ProvingKey<C>,
@@ -49,10 +53,7 @@ pub fn create_proof<
     instances: &[&[&[C::Scalar]]],
     mut rng: R,
     transcript: &mut T,
-) -> Result<(), Error>
-where
-    ConcreteCircuit::Config: Send,
-{
+) -> Result<(), Error> {
     if circuits.len() != instances.len() {
         return Err(Error::InvalidInstances);
     }
@@ -67,8 +68,6 @@ where
     pk.vk.hash_into(transcript)?;
 
     let domain = &pk.vk.domain;
-    let mut meta = ConstraintSystem::default();
-    let config = ConcreteCircuit::configure(&mut meta);
 
     // Selector optimizations cannot be applied here; use the ConstraintSystem
     // from the verification key.
@@ -169,11 +168,8 @@ where
     let advice: Vec<_> = circuits
         .into_par_iter()
         .zip(instances.into_par_iter())
-        .zip(vec![config; circuits.len()].into_par_iter())
         .zip(advice_randomness.into_par_iter())
-        .map(|(((circuit, instances), config), randomness)| {
-            let (blinding_rows, advice_blinds) = randomness;
-
+        .map(|((circuit, instances), (blinding_rows, advice_blinds))| {
             struct WitnessCollection<'a, F: Field> {
                 k: u32,
                 pub advice: Vec<Polynomial<Assigned<F>, LagrangeCoeff>>,
@@ -315,6 +311,12 @@ where
                 usable_rows: ..unusable_rows_start,
                 _marker: std::marker::PhantomData,
             };
+
+            // Configure the circuit on this thread rather than sharing one
+            // `Config` between threads, so that `ConcreteCircuit::Config` need
+            // not be `Send`. `configure` is deterministic (key generation relies
+            // on this too), so every circuit gets the same configuration.
+            let config = ConcreteCircuit::configure(&mut ConstraintSystem::default());
 
             // Synthesize the circuit to obtain the witness and other information.
             ConcreteCircuit::FloorPlanner::synthesize(
