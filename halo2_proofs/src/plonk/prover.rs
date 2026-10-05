@@ -24,20 +24,28 @@ use crate::{
     },
 };
 use crate::{
+    multicore::IntoParallelIterator,
     poly::batch_invert_assigned,
     transcript::{EncodedChallenge, TranscriptWrite},
 };
+
+#[cfg(feature = "multicore")]
+use crate::multicore::{IndexedParallelIterator, ParallelIterator};
 
 /// This creates a proof for the provided `circuit` when given the public
 /// parameters `params` and the proving key [`ProvingKey`] that was
 /// generated previously for the same circuit. The provided `instances`
 /// are zero-padded internally.
+// The per-circuit stages below are collected before their results are written to
+// the transcript. With `multicore` that collect is what joins the parallel work;
+// without it the iterators are sequential and clippy considers the collect needless.
+#[cfg_attr(not(feature = "multicore"), allow(clippy::needless_collect))]
 pub fn create_proof<
     C: CurveAffine,
     E: EncodedChallenge<C>,
     R: RngCore,
     T: TranscriptWrite<C, E>,
-    ConcreteCircuit: Circuit<C::Scalar>,
+    ConcreteCircuit: Circuit<C::Scalar> + Sync,
 >(
     params: &Params<C>,
     pk: &ProvingKey<C>,
@@ -60,8 +68,6 @@ pub fn create_proof<
     pk.vk.hash_into(transcript)?;
 
     let domain = &pk.vk.domain;
-    let mut meta = ConstraintSystem::default();
-    let config = ConcreteCircuit::configure(&mut meta);
 
     // Selector optimizations cannot be applied here; use the ConstraintSystem
     // from the verification key.
@@ -132,10 +138,38 @@ pub fn create_proof<
         pub advice_blinds: Vec<Blind<C::Scalar>>,
     }
 
-    let advice: Vec<AdviceSingle<C>> = circuits
+    let unusable_rows_start = params.n as usize - (meta.blinding_factors() + 1);
+
+    // Draw the randomness that blinds the advice columns of every circuit up front,
+    // in the order in which it has always been drawn: for each circuit, the blinding
+    // rows of each advice column, then the blinds of the advice commitments.
+    let advice_randomness: Vec<_> = circuits
         .iter()
-        .zip(instances.iter())
-        .map(|(circuit, instances)| -> Result<AdviceSingle<C>, Error> {
+        .map(|_| {
+            let blinding_rows: Vec<Vec<C::Scalar>> = (0..meta.num_advice_columns)
+                .map(|_| {
+                    (unusable_rows_start..params.n as usize)
+                        .map(|_| C::Scalar::random(&mut rng))
+                        .collect()
+                })
+                .collect();
+            let advice_blinds: Vec<_> = (0..meta.num_advice_columns)
+                .map(|_| Blind(C::Scalar::random(&mut rng)))
+                .collect();
+            (blinding_rows, advice_blinds)
+        })
+        .collect();
+
+    // Synthesize, blind and commit to the witness of every circuit. None of this
+    // draws randomness or touches the transcript, so it runs for all circuits
+    // concurrently; the commitments are written to the transcript afterwards in
+    // circuit order. For a given `rng` the proof is therefore byte-for-byte the
+    // same as when the circuits are processed one after another.
+    let advice: Vec<_> = circuits
+        .into_par_iter()
+        .zip(instances.into_par_iter())
+        .zip(advice_randomness.into_par_iter())
+        .map(|((circuit, instances), (blinding_rows, advice_blinds))| {
             struct WitnessCollection<'a, F: Field> {
                 k: u32,
                 pub advice: Vec<Polynomial<Assigned<F>, LagrangeCoeff>>,
@@ -266,8 +300,6 @@ pub fn create_proof<
                 }
             }
 
-            let unusable_rows_start = params.n as usize - (meta.blinding_factors() + 1);
-
             let mut witness = WitnessCollection {
                 k: params.k,
                 advice: vec![domain.empty_lagrange_assigned(); meta.num_advice_columns],
@@ -280,59 +312,67 @@ pub fn create_proof<
                 _marker: std::marker::PhantomData,
             };
 
+            // Configure the circuit on this thread rather than sharing one
+            // `Config` between threads, so that `ConcreteCircuit::Config` need
+            // not be `Send`. `configure` is deterministic (key generation relies
+            // on this too), so every circuit gets the same configuration.
+            let config = ConcreteCircuit::configure(&mut ConstraintSystem::default());
+
             // Synthesize the circuit to obtain the witness and other information.
             ConcreteCircuit::FloorPlanner::synthesize(
                 &mut witness,
                 circuit,
-                config.clone(),
+                config,
                 meta.constants.clone(),
             )?;
 
             let mut advice = batch_invert_assigned(witness.advice);
 
             // Add blinding factors to advice columns
-            for advice in &mut advice {
-                for cell in &mut advice[unusable_rows_start..] {
-                    *cell = C::Scalar::random(&mut rng);
-                }
+            for (advice, blinding_rows) in advice.iter_mut().zip(blinding_rows) {
+                advice[unusable_rows_start..].copy_from_slice(&blinding_rows);
             }
 
             // Compute commitments to advice column polynomials
-            let advice_blinds: Vec<_> = advice
-                .iter()
-                .map(|_| Blind(C::Scalar::random(&mut rng)))
-                .collect();
-            let advice_commitments_projective: Vec<_> = advice
-                .iter()
-                .zip(advice_blinds.iter())
+            let advice_commitments_projective: Vec<_> = (&advice)
+                .into_par_iter()
+                .zip((&advice_blinds).into_par_iter())
                 .map(|(poly, blind)| params.commit_lagrange(poly, *blind))
                 .collect();
             let mut advice_commitments = vec![C::identity(); advice_commitments_projective.len()];
             C::Curve::batch_normalize(&advice_commitments_projective, &mut advice_commitments);
-            let advice_commitments = advice_commitments;
             drop(advice_commitments_projective);
-
-            for commitment in &advice_commitments {
-                transcript.write_point(*commitment)?;
-            }
 
             let advice_polys: Vec<_> = advice
                 .clone()
-                .into_iter()
+                .into_par_iter()
                 .map(|poly| domain.lagrange_to_coeff(poly))
                 .collect();
 
-            let advice_cosets: Vec<_> = advice_polys
-                .iter()
+            let advice_cosets: Vec<_> = (&advice_polys)
+                .into_par_iter()
                 .map(|poly| domain.coeff_to_extended(poly.clone()))
                 .collect();
 
-            Ok(AdviceSingle {
+            let advice = AdviceSingle {
                 advice_values: advice,
                 advice_polys,
                 advice_cosets,
                 advice_blinds,
-            })
+            };
+            Ok::<_, Error>((advice, advice_commitments))
+        })
+        .collect();
+
+    let advice: Vec<AdviceSingle<C>> = advice
+        .into_iter()
+        .map(|advice| -> Result<_, Error> {
+            // Errors are reported for the first failing circuit, as before.
+            let (advice, advice_commitments) = advice?;
+            for commitment in &advice_commitments {
+                transcript.write_point(*commitment)?;
+            }
+            Ok(advice)
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -420,35 +460,59 @@ pub fn create_proof<
     // Sample theta challenge for keeping lookup columns linearly independent
     let theta: ChallengeTheta<_> = transcript.squeeze_challenge_scalar();
 
-    let lookups: Vec<Vec<lookup::prover::Permuted<C, _>>> = instance_values
+    // Draw the randomness for every lookup argument of every circuit up front, in
+    // the order in which it has always been drawn. The permuted values can then be
+    // constructed and committed to for all lookups concurrently; the commitments
+    // are written to the transcript afterwards in the original order.
+    let lookup_blindings: Vec<Vec<_>> = circuits
         .iter()
-        .zip(instance_cosets.iter())
-        .zip(advice_values.iter())
-        .zip(advice_cosets.iter())
-        .map(|(((instance_values, instance_cosets), advice_values), advice_cosets)| -> Result<Vec<_>, Error> {
-            // Construct and commit to permuted values for each lookup
-            pk.vk
-                .cs
-                .lookups
+        .map(|_| {
+            meta.lookups
                 .iter()
-                .map(|lookup| {
-                    lookup.commit_permuted(
-                        pk,
-                        params,
-                        domain,
-                        &value_evaluator,
-                        &mut coset_evaluator,
-                        theta,
-                        advice_values,
-                        &fixed_values,
-                        instance_values,
-                        advice_cosets,
-                        &fixed_cosets,
-                        instance_cosets,
-                        &mut rng,
-                        transcript,
-                    )
-                })
+                .map(|_| lookup::prover::PermutedBlinding::draw(meta.blinding_factors(), &mut rng))
+                .collect()
+        })
+        .collect();
+
+    let lookups: Vec<Vec<_>> = (&instance_values)
+        .into_par_iter()
+        .zip((&instance_cosets).into_par_iter())
+        .zip((&advice_values).into_par_iter())
+        .zip((&advice_cosets).into_par_iter())
+        .zip(lookup_blindings.into_par_iter())
+        .map(
+            |((((instance_values, instance_cosets), advice_values), advice_cosets), blindings)| {
+                // Construct and commit to permuted values for each lookup
+                (&meta.lookups)
+                    .into_par_iter()
+                    .zip(blindings.into_par_iter())
+                    .map(|(lookup, blinding)| {
+                        lookup.commit_permuted(
+                            pk,
+                            params,
+                            domain,
+                            &value_evaluator,
+                            theta,
+                            advice_values,
+                            &fixed_values,
+                            instance_values,
+                            advice_cosets,
+                            &fixed_cosets,
+                            instance_cosets,
+                            blinding,
+                        )
+                    })
+                    .collect()
+            },
+        )
+        .collect();
+
+    let lookups: Vec<Vec<lookup::prover::Permuted<C, _>>> = lookups
+        .into_iter()
+        .map(|lookups: Vec<_>| -> Result<Vec<_>, Error> {
+            lookups
+                .into_iter()
+                .map(|lookup| lookup?.finish(&mut coset_evaluator, transcript))
                 .collect()
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -459,11 +523,19 @@ pub fn create_proof<
     // Sample gamma challenge
     let gamma: ChallengeGamma<_> = transcript.squeeze_challenge_scalar();
 
-    // Commit to permutations.
-    let permutations: Vec<permutation::prover::Committed<C, _>> = instance
+    // Commit to permutations. As for the lookups above, the randomness is drawn
+    // up front in the original order, the grand products of all circuits are
+    // committed to concurrently, and the commitments are written to the transcript
+    // in the original order.
+    let permutation_blindings: Vec<_> = circuits
         .iter()
-        .zip(advice.iter())
-        .map(|(instance, advice)| {
+        .map(|_| pk.vk.cs.permutation.draw_blinding(pk, &mut rng))
+        .collect();
+    let permutations: Vec<_> = (&instance)
+        .into_par_iter()
+        .zip((&advice).into_par_iter())
+        .zip(permutation_blindings.into_par_iter())
+        .map(|((instance, advice), blinding)| {
             pk.vk.cs.permutation.commit(
                 params,
                 pk,
@@ -473,31 +545,43 @@ pub fn create_proof<
                 &instance.instance_values,
                 beta,
                 gamma,
-                &mut coset_evaluator,
-                &mut rng,
-                transcript,
+                blinding,
             )
         })
+        .collect();
+    let permutations: Vec<permutation::prover::Committed<C, _>> = permutations
+        .into_iter()
+        .map(|permutation| permutation.finish(&mut coset_evaluator, transcript))
         .collect::<Result<Vec<_>, _>>()?;
 
+    // Construct and commit to products for each lookup, in the same way.
+    let product_blindings: Vec<Vec<_>> = lookups
+        .iter()
+        .map(|lookups| {
+            lookups
+                .iter()
+                .map(|_| lookup::prover::ProductBlinding::draw(meta.blinding_factors(), &mut rng))
+                .collect()
+        })
+        .collect();
+    let lookups: Vec<Vec<_>> = lookups
+        .into_par_iter()
+        .zip(product_blindings.into_par_iter())
+        .map(|(lookups, blindings)| {
+            lookups
+                .into_par_iter()
+                .zip(blindings.into_par_iter())
+                .map(|(lookup, blinding)| lookup.commit_product(pk, params, beta, gamma, blinding))
+                .collect()
+        })
+        .collect();
     let lookups: Vec<Vec<lookup::prover::Committed<C, _>>> = lookups
         .into_iter()
-        .map(|lookups| -> Result<Vec<_>, _> {
-            // Construct and commit to products for each lookup
+        .map(|lookups: Vec<_>| -> Result<Vec<_>, Error> {
             lookups
                 .into_iter()
-                .map(|lookup| {
-                    lookup.commit_product(
-                        pk,
-                        params,
-                        beta,
-                        gamma,
-                        &mut coset_evaluator,
-                        &mut rng,
-                        transcript,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()
+                .map(|lookup| lookup.finish(&mut coset_evaluator, transcript))
+                .collect()
         })
         .collect::<Result<Vec<_>, _>>()?;
 

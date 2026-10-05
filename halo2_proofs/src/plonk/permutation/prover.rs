@@ -29,6 +29,29 @@ pub(crate) struct Committed<C: CurveAffine, Ev> {
     sets: Vec<CommittedSet<C, Ev>>,
 }
 
+/// The randomness that [`Argument::commit`] uses for one column set of one circuit.
+///
+/// It is drawn up front, in the order in which committing to the permutation has
+/// always drawn it, so that the permutation arguments of several circuits can be
+/// committed to concurrently without changing the proof for a given RNG.
+pub(crate) struct SetBlinding<F: Field> {
+    rows: Vec<F>,
+    blind: Blind<F>,
+}
+
+struct PendingSet<C: CurveAffine> {
+    permutation_product_poly: Polynomial<C::Scalar, Coeff>,
+    permutation_product_coset: Polynomial<C::Scalar, ExtendedLagrangeCoeff>,
+    permutation_product_blind: Blind<C::Scalar>,
+    permutation_product_commitment: C,
+}
+
+/// A permutation argument whose grand products have been committed to, but whose
+/// commitments have not been written to the transcript yet.
+pub(crate) struct CommittedPending<C: CurveAffine> {
+    sets: Vec<PendingSet<C>>,
+}
+
 pub struct ConstructedSet<C: CurveAffine> {
     permutation_product_poly: Polynomial<C::Scalar, Coeff>,
     permutation_product_blind: Blind<C::Scalar>,
@@ -43,14 +66,43 @@ pub(crate) struct Evaluated<C: CurveAffine> {
 }
 
 impl Argument {
+    /// How many columns can be included in a single permutation polynomial?
+    fn chunk_len<C: CurveAffine>(pk: &plonk::ProvingKey<C>) -> usize {
+        // We need to multiply by z(X) and (1 - (l_last(X) + l_blind(X))). This
+        // will never underflow because of the requirement of at least a degree
+        // 3 circuit for the permutation argument.
+        assert!(pk.vk.cs_degree >= 3);
+        pk.vk.cs_degree - 2
+    }
+
+    /// Draws the randomness for [`Argument::commit`]: for each column set, the
+    /// blinding rows of its grand product, then the blind of its commitment.
+    pub(in crate::plonk) fn draw_blinding<C: CurveAffine>(
+        &self,
+        pk: &plonk::ProvingKey<C>,
+        mut rng: impl RngCore,
+    ) -> Vec<SetBlinding<C::Scalar>> {
+        let blinding_factors = pk.vk.cs.blinding_factors();
+        self.columns
+            .chunks(Self::chunk_len(pk))
+            .map(|_| {
+                let rows = (0..blinding_factors)
+                    .map(|_| C::Scalar::random(&mut rng))
+                    .collect();
+                let blind = Blind(C::Scalar::random(&mut rng));
+                SetBlinding { rows, blind }
+            })
+            .collect()
+    }
+
+    /// Commits to the grand products of this permutation argument.
+    ///
+    /// This draws no randomness (it is passed in as `blinding`, see
+    /// [`Argument::draw_blinding`]) and does not touch the transcript, so it can
+    /// run concurrently for several circuits; [`CommittedPending::finish`] then
+    /// writes the commitments to the transcript.
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::plonk) fn commit<
-        C: CurveAffine,
-        E: EncodedChallenge<C>,
-        Ev: Copy + Send + Sync,
-        R: RngCore,
-        T: TranscriptWrite<C, E>,
-    >(
+    pub(in crate::plonk) fn commit<C: CurveAffine>(
         &self,
         params: &Params<C>,
         pk: &plonk::ProvingKey<C>,
@@ -60,18 +112,11 @@ impl Argument {
         instance: &[Polynomial<C::Scalar, LagrangeCoeff>],
         beta: ChallengeBeta<C>,
         gamma: ChallengeGamma<C>,
-        evaluator: &mut poly::Evaluator<Ev, C::Scalar, ExtendedLagrangeCoeff>,
-        mut rng: R,
-        transcript: &mut T,
-    ) -> Result<Committed<C, Ev>, Error> {
+        blinding: Vec<SetBlinding<C::Scalar>>,
+    ) -> CommittedPending<C> {
         let domain = &pk.vk.domain;
 
-        // How many columns can be included in a single permutation polynomial?
-        // We need to multiply by z(X) and (1 - (l_last(X) + l_blind(X))). This
-        // will never underflow because of the requirement of at least a degree
-        // 3 circuit for the permutation argument.
-        assert!(pk.vk.cs_degree >= 3);
-        let chunk_len = pk.vk.cs_degree - 2;
+        let chunk_len = Self::chunk_len(pk);
         let blinding_factors = pk.vk.cs.blinding_factors();
 
         // Each column gets its own delta power.
@@ -82,10 +127,12 @@ impl Argument {
 
         let mut sets = vec![];
 
-        for (columns, permutations) in self
+        assert_eq!(blinding.len(), self.columns.chunks(chunk_len).len());
+        for ((columns, permutations), blinding) in self
             .columns
             .chunks(chunk_len)
             .zip(pkey.permutations.chunks(chunk_len))
+            .zip(blinding)
         {
             // Goal is to compute the products of fractions
             //
@@ -161,34 +208,63 @@ impl Argument {
             }
             let mut z = domain.lagrange_from_vec(z);
             // Set blinding factors
-            for z in &mut z[params.n as usize - blinding_factors..] {
-                *z = C::Scalar::random(&mut rng);
-            }
+            z[params.n as usize - blinding_factors..].copy_from_slice(&blinding.rows);
             // Set new last_z
             last_z = z[params.n as usize - (blinding_factors + 1)];
 
-            let blind = Blind(C::Scalar::random(&mut rng));
+            let blind = blinding.blind;
 
             let permutation_product_commitment_projective = params.commit_lagrange(&z, blind);
             let permutation_product_blind = blind;
             let z = domain.lagrange_to_coeff(z);
             let permutation_product_poly = z.clone();
 
-            let permutation_product_coset =
-                evaluator.register_poly(domain.coeff_to_extended(z.clone()));
+            let permutation_product_coset = domain.coeff_to_extended(z);
 
             let permutation_product_commitment =
                 permutation_product_commitment_projective.to_affine();
 
-            // Hash the permutation product commitment
-            transcript.write_point(permutation_product_commitment)?;
-
-            sets.push(CommittedSet {
+            sets.push(PendingSet {
                 permutation_product_poly,
                 permutation_product_coset,
                 permutation_product_blind,
+                permutation_product_commitment,
             });
         }
+
+        CommittedPending { sets }
+    }
+}
+
+impl<C: CurveAffine> CommittedPending<C> {
+    /// Registers the coset of each grand product with `evaluator`, and writes the
+    /// commitments to the transcript.
+    pub(in crate::plonk) fn finish<
+        E: EncodedChallenge<C>,
+        Ev: Copy + Send + Sync,
+        T: TranscriptWrite<C, E>,
+    >(
+        self,
+        evaluator: &mut poly::Evaluator<Ev, C::Scalar, ExtendedLagrangeCoeff>,
+        transcript: &mut T,
+    ) -> Result<Committed<C, Ev>, Error> {
+        let sets = self
+            .sets
+            .into_iter()
+            .map(|set| {
+                let permutation_product_coset =
+                    evaluator.register_poly(set.permutation_product_coset);
+
+                // Hash the permutation product commitment
+                transcript.write_point(set.permutation_product_commitment)?;
+
+                Ok(CommittedSet {
+                    permutation_product_poly: set.permutation_product_poly,
+                    permutation_product_coset,
+                    permutation_product_blind: set.permutation_product_blind,
+                })
+            })
+            .collect::<Result<_, Error>>()?;
 
         Ok(Committed { sets })
     }
