@@ -14,6 +14,8 @@ and this project adheres to Rust's notion of
   `pasta_curves`' variable-time GLV scalar multiplication when the curve is
   Pallas or Vesta. The collapse only multiplies public generators by public
   Fiat-Shamir challenges; proofs are byte-for-byte unchanged.
+- The IPA opening computes each round's `L` and `R` (including their `U` and
+  `W` terms) with one multiexp each instead of two.
 - `halo2_proofs::plonk::create_proof` and `halo2_proofs::plonk::verify_proof`
   now commit to instance columns from the supplied values directly, instead of
   zero-padding them to the evaluation domain first. The commitments are

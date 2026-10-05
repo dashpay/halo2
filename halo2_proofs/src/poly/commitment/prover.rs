@@ -107,17 +107,24 @@ pub fn create_proof<
         let half = 1 << (params.k - j - 1); // half the length of `p_prime`, `b`, `G'`
 
         // Compute L, R
-        //
-        // TODO: If we modify multiexp to take "extra" bases, we could speed
-        // this piece up a bit by combining the multiexps.
-        let l_j = best_multiexp(&p_prime[half..], &g_prime[0..half]);
-        let r_j = best_multiexp(&p_prime[0..half], &g_prime[half..]);
         let value_l_j = compute_inner_product(&p_prime[half..], &b[0..half]);
         let value_r_j = compute_inner_product(&p_prime[0..half], &b[half..]);
         let l_j_randomness = C::Scalar::random(&mut rng);
         let r_j_randomness = C::Scalar::random(&mut rng);
-        let l_j = l_j + &best_multiexp(&[value_l_j * &z, l_j_randomness], &[params.u, params.w]);
-        let r_j = r_j + &best_multiexp(&[value_r_j * &z, r_j_randomness], &[params.u, params.w]);
+        let l_j = multiexp_with_u_w(
+            params,
+            &p_prime[half..],
+            &g_prime[0..half],
+            value_l_j * &z,
+            l_j_randomness,
+        );
+        let r_j = multiexp_with_u_w(
+            params,
+            &p_prime[0..half],
+            &g_prime[half..],
+            value_r_j * &z,
+            r_j_randomness,
+        );
         let l_j = l_j.to_affine();
         let r_j = r_j.to_affine();
 
@@ -155,6 +162,28 @@ pub fn create_proof<
     transcript.write_scalar(f)?;
 
     Ok(())
+}
+
+/// Computes `<scalars, bases> + [u_scalar] U + [w_scalar] W` as a single
+/// multiexp. (A separate two-term multiexp for the `U` and `W` terms costs
+/// about as much as a full-width scalar multiplication, i.e. more than the
+/// two extra terms add to the main multiexp.)
+fn multiexp_with_u_w<C: CurveAffine>(
+    params: &Params<C>,
+    scalars: &[C::Scalar],
+    bases: &[C],
+    u_scalar: C::Scalar,
+    w_scalar: C::Scalar,
+) -> C::Curve {
+    let mut all_scalars = Vec::with_capacity(scalars.len() + 2);
+    all_scalars.extend_from_slice(scalars);
+    all_scalars.extend([u_scalar, w_scalar]);
+
+    let mut all_bases = Vec::with_capacity(bases.len() + 2);
+    all_bases.extend_from_slice(bases);
+    all_bases.extend([params.u, params.w]);
+
+    best_multiexp(&all_scalars, &all_bases)
 }
 
 /// Collapses the generator vector `g` of even length `2m` in place, so that its
