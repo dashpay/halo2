@@ -90,9 +90,11 @@ pub fn create_proof<
                     Ok(poly)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let instance_commitments_projective: Vec<_> = instance_values
+            // `instance_values` are these values zero-padded to the domain;
+            // committing to the unpadded prefix gives the same commitment.
+            let instance_commitments_projective: Vec<_> = instance
                 .iter()
-                .map(|poly| params.commit_lagrange(poly, Blind::default()))
+                .map(|values| params.commit_lagrange_prefix(values, Blind::default()))
                 .collect();
             let mut instance_commitments =
                 vec![C::identity(); instance_commitments_projective.len()];

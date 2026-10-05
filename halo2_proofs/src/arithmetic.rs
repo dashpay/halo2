@@ -9,7 +9,7 @@ use group::{
 use maybe_rayon::prelude::*;
 pub use pasta_curves::arithmetic::*;
 
-use crate::multicore::{self, TheBestReduce};
+use crate::multicore;
 
 /// This represents an element of a group with basic operations that can be
 /// performed. This allows an FFT implementation (for example) to operate
@@ -34,12 +34,12 @@ enum Bucket<C: CurveAffine> {
 }
 
 impl<C: CurveAffine> Bucket<C> {
-    fn add_assign(&mut self, other: &C) {
+    fn add_assign(&mut self, other: C) {
         *self = match *self {
-            Bucket::None => Bucket::Affine(*other),
-            Bucket::Affine(a) => Bucket::Projective(a + *other),
+            Bucket::None => Bucket::Affine(other),
+            Bucket::Affine(a) => Bucket::Projective(a + other),
             Bucket::Projective(mut a) => {
-                a += *other;
+                a += other;
                 Bucket::Projective(a)
             }
         }
@@ -57,26 +57,99 @@ impl<C: CurveAffine> Bucket<C> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BoothDigit {
+    magnitude: usize,
+    negative: bool,
+}
+
+fn booth_digit(bytes: &[u8], window_bits: usize, window: usize) -> BoothDigit {
+    debug_assert!(window_bits > 0);
+    debug_assert!(window_bits < u64::BITS as usize);
+
+    let window_start = window * window_bits;
+    let byte_start = window_start / 8;
+    let mut encoded = [0; 8];
+    if byte_start < bytes.len() {
+        for (slot, byte) in encoded.iter_mut().zip(&bytes[byte_start..]) {
+            *slot = *byte;
+        }
+    }
+
+    let bit_offset = window_start - byte_start * 8;
+    let radix = 1usize << window_bits;
+    let value = ((u64::from_le_bytes(encoded) >> bit_offset) as usize) & (radix - 1);
+    let overlap = if window_start == 0 {
+        0
+    } else {
+        let bit = window_start - 1;
+        bytes
+            .get(bit / 8)
+            .map_or(0, |byte| usize::from((byte >> (bit % 8)) & 1))
+    };
+
+    // The bit below each window is its carry-in, while the window's high bit
+    // is its carry-out. These terms cancel between adjacent windows, leaving
+    // a signed digit whose magnitude is at most half the radix.
+    if value < radix / 2 {
+        BoothDigit {
+            magnitude: value + overlap,
+            negative: false,
+        }
+    } else {
+        let magnitude = radix - value - overlap;
+        BoothDigit {
+            magnitude,
+            negative: magnitude != 0,
+        }
+    }
+}
+
+fn booth_window_count<R: AsRef<[u8]>>(reprs: &[R], window_bits: usize) -> usize {
+    debug_assert!(window_bits > 0);
+
+    let repr_bytes = reprs
+        .iter()
+        .map(|repr| repr.as_ref().len())
+        .max()
+        .unwrap_or(0);
+    let repr_bits = repr_bytes
+        .checked_mul(u8::BITS as usize)
+        .expect("scalar representation is too large");
+
+    // Integer division reserves an additional carry window exactly when the
+    // representation ends on a window boundary. Otherwise, the last partial
+    // window cannot produce a carry.
+    repr_bits / window_bits + 1
+}
+
 #[derive(Clone)]
-struct Buckets<C: CurveAffine> {
+struct BoothBuckets<C: CurveAffine> {
     c: usize,
     coeffs: Vec<Bucket<C>>,
 }
 
-impl<C: CurveAffine> Buckets<C> {
+impl<C: CurveAffine> BoothBuckets<C> {
     fn new(c: usize) -> Self {
         Self {
             c,
-            coeffs: vec![Bucket::None; (1 << c) - 1],
+            coeffs: vec![Bucket::None; 1 << (c - 1)],
         }
     }
 
-    fn sum(&mut self, coeffs: &[C::Scalar], bases: &[C], i: usize) -> C::Curve {
-        // get segmentation and add coeff to buckets content
+    fn sum(
+        &mut self,
+        coeffs: &[<C::Scalar as PrimeField>::Repr],
+        bases: &[C],
+        i: usize,
+    ) -> C::Curve {
+        // Recode each scalar window into a signed digit and add its base to
+        // the bucket for the digit's magnitude.
         for (coeff, base) in coeffs.iter().zip(bases.iter()) {
-            let seg = self.get_at::<C::Scalar>(i, &coeff.to_repr());
-            if seg != 0 {
-                self.coeffs[seg - 1].add_assign(base);
+            let digit = booth_digit(coeff.as_ref(), self.c, i);
+            if digit.magnitude != 0 {
+                let base = if digit.negative { -*base } else { *base };
+                self.coeffs[digit.magnitude - 1].add_assign(base);
             }
         }
         // Summation by parts
@@ -90,24 +163,6 @@ impl<C: CurveAffine> Buckets<C> {
             acc += sum;
         });
         acc
-    }
-
-    fn get_at<F: PrimeField>(&self, segment: usize, bytes: &F::Repr) -> usize {
-        let skip_bits = segment * self.c;
-        let skip_bytes = skip_bits / 8;
-
-        if skip_bytes >= 32 {
-            0
-        } else {
-            let mut v = [0; 8];
-            for (v, o) in v.iter_mut().zip(bytes.as_ref()[skip_bytes..].iter()) {
-                *v = *o;
-            }
-
-            let mut tmp = u64::from_le_bytes(v);
-            tmp >>= skip_bits - (skip_bytes * 8);
-            (tmp % (1 << self.c)) as usize
-        }
     }
 }
 
@@ -143,6 +198,9 @@ pub fn small_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::C
 pub fn best_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
     assert_eq!(coeffs.len(), bases.len());
 
+    // Convert to canonical representations once instead of once per window.
+    let coeffs = coeffs.iter().map(PrimeField::to_repr).collect::<Vec<_>>();
+
     let c = if bases.len() < 4 {
         1
     } else if bases.len() < 32 {
@@ -151,32 +209,38 @@ pub fn best_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Cu
         (f64::from(bases.len() as u32)).ln().ceil() as usize
     };
 
-    let mut multi_buckets: Vec<Buckets<C>> = vec![Buckets::new(c); (256 / c) + 1];
+    let mut multi_buckets: Vec<BoothBuckets<C>> =
+        vec![BoothBuckets::new(c); booth_window_count(&coeffs, c)];
     let num_threads = multicore::current_num_threads();
-    if coeffs.len() > num_threads {
+    let window_sums: Vec<C::Curve> = if coeffs.len() > num_threads {
         multi_buckets
             .par_iter_mut()
             .enumerate()
-            .rev()
-            .map(|(i, buckets)| {
-                let mut acc = buckets.sum(coeffs, bases, i);
-                (0..c * i).for_each(|_| acc = acc.double());
-                acc
-            })
-            .the_best_reduce(C::Curve::identity, |a, b| a + b)
-            .expect("multi_buckets always contains at least 1 bucket")
+            .map(|(i, buckets)| buckets.sum(&coeffs, bases, i))
+            .collect()
     } else {
         multi_buckets
             .iter_mut()
             .enumerate()
-            .rev()
-            .map(|(i, buckets)| buckets.sum(coeffs, bases, i))
-            .fold(C::Curve::identity(), |mut sum, bucket| {
-                // restore original evaluation point
-                (0..c).for_each(|_| sum = sum.double());
-                sum + bucket
-            })
+            .map(|(i, buckets)| buckets.sum(&coeffs, bases, i))
+            .collect()
+    };
+
+    // Combine the window sums with Horner's rule, from the most significant
+    // window down: acc = acc * 2^c + window_sum. This costs c doublings per
+    // window in total, rather than c * i doublings for window i if each
+    // window were shifted into place independently.
+    let mut window_sums = window_sums.into_iter().rev();
+    let mut acc = window_sums
+        .next()
+        .expect("multi_buckets always contains at least 1 window");
+    for window_sum in window_sums {
+        for _ in 0..c {
+            acc = acc.double();
+        }
+        acc += window_sum;
     }
+    acc
 }
 
 /// Performs a radix-$2$ Fast-Fourier Transformation (FFT) on a vector of size
@@ -435,26 +499,365 @@ pub fn lagrange_interpolate<F: Field>(points: &[F], evals: &[F]) -> Vec<F> {
 use rand_core::OsRng;
 
 #[cfg(test)]
-use crate::pasta::{Eq, EqAffine, Fp};
+use crate::pasta::{Ep, EpAffine, Eq, EqAffine, Fp, Fq};
+
+#[cfg(test)]
+use group::{prime::PrimeCurveAffine, Curve};
+
+#[cfg(test)]
+fn assert_multiexp_matches_naive<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) {
+    assert_eq!(best_multiexp(coeffs, bases), naive_multiexp(coeffs, bases));
+}
+
+/// The reference result: each term computed with the curve's own scalar
+/// multiplication, then summed.
+#[cfg(test)]
+fn naive_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
+    coeffs
+        .iter()
+        .zip(bases)
+        .map(|(coeff, base)| *base * coeff)
+        .fold(C::Curve::identity(), |acc, val| acc + val)
+}
+
+#[cfg(test)]
+fn evaluate_le_bytes(bytes: &[u8]) -> Fp {
+    bytes.iter().rev().fold(Fp::ZERO, |mut acc, byte| {
+        for bit in (0..u8::BITS).rev() {
+            acc = acc.double();
+            if (byte >> bit) & 1 != 0 {
+                acc += Fp::ONE;
+            }
+        }
+        acc
+    })
+}
+
+#[cfg(test)]
+fn evaluate_booth_digits(bytes: &[u8], window_bits: usize) -> Fp {
+    (0..booth_window_count(&[bytes], window_bits))
+        .rev()
+        .fold(Fp::ZERO, |mut acc, window| {
+            for _ in 0..window_bits {
+                acc = acc.double();
+            }
+
+            let digit = booth_digit(bytes, window_bits, window);
+            let magnitude = Fp::from(digit.magnitude as u64);
+            if digit.negative {
+                acc -= magnitude;
+            } else {
+                acc += magnitude;
+            }
+            acc
+        })
+}
 
 #[test]
 fn test_multiexp() {
     let rng = OsRng;
-    let k = 8;
+    for len in [0, 1, 2, 3, 4, 31, 32, 33, 255, 256, 257] {
+        let coeffs = (0..len).map(|_| Fp::random(rng)).collect::<Vec<_>>();
+        let bases = (0..len)
+            .map(|_| EqAffine::from(Eq::random(rng)))
+            .collect::<Vec<_>>();
 
-    let coeffs = (0..(1 << k)).map(|_| Fp::random(rng)).collect::<Vec<_>>();
-    let bases = (0..(1 << k))
+        assert_multiexp_matches_naive(&coeffs, &bases);
+    }
+}
+
+#[test]
+fn test_booth_digit_boundaries() {
+    let assert_digit = |bytes: &[u8], window_bits, window, magnitude, negative| {
+        assert_eq!(
+            booth_digit(bytes, window_bits, window),
+            BoothDigit {
+                magnitude,
+                negative,
+            }
+        );
+    };
+
+    let repr_bytes = <Fp as PrimeField>::Repr::default().as_ref().len();
+    let mut bytes = vec![0; repr_bytes];
+    assert_digit(&bytes, 3, 0, 0, false);
+
+    bytes[0] = 3;
+    assert_digit(&bytes, 3, 0, 3, false);
+
+    bytes[0] = 4;
+    assert_digit(&bytes, 3, 0, 4, true);
+    assert_digit(&bytes, 3, 1, 1, false);
+
+    bytes[0] = 7;
+    assert_digit(&bytes, 3, 0, 1, true);
+    assert_digit(&bytes, 3, 1, 1, false);
+
+    let bytes = vec![u8::MAX; repr_bytes];
+    assert_digit(&bytes, 8, 31, 0, false);
+    assert_digit(&bytes, 8, 32, 1, false);
+}
+
+#[test]
+fn test_booth_digit_wide_representation() {
+    const WIDE_REPR_BYTES: usize = 40;
+    const FIRST_WIDE_BYTE: usize = 32;
+    const WINDOW_BITS: usize = 8;
+    const HALF_RADIX: usize = 1 << (WINDOW_BITS - 1);
+
+    // A high-half value in the first byte above 256 bits produces a negative
+    // digit whose carry must be consumed by the following window.
+    let mut bytes = [0; WIDE_REPR_BYTES];
+    let short_bytes = [0; FIRST_WIDE_BYTE];
+    assert_eq!(
+        booth_window_count(&[short_bytes.as_slice(), bytes.as_slice()], WINDOW_BITS),
+        WIDE_REPR_BYTES + 1
+    );
+
+    bytes[FIRST_WIDE_BYTE] = HALF_RADIX as u8;
+    assert_eq!(
+        booth_digit(&bytes, WINDOW_BITS, FIRST_WIDE_BYTE),
+        BoothDigit {
+            magnitude: HALF_RADIX,
+            negative: true,
+        }
+    );
+    assert_eq!(
+        booth_digit(&bytes, WINDOW_BITS, FIRST_WIDE_BYTE + 1),
+        BoothDigit {
+            magnitude: 1,
+            negative: false,
+        }
+    );
+
+    // The final data window likewise has a following carry-only window.
+    bytes = [0; WIDE_REPR_BYTES];
+    bytes[WIDE_REPR_BYTES - 1] = HALF_RADIX as u8;
+    assert_eq!(
+        booth_digit(&bytes, WINDOW_BITS, WIDE_REPR_BYTES - 1),
+        BoothDigit {
+            magnitude: HALF_RADIX,
+            negative: true,
+        }
+    );
+    assert_eq!(
+        booth_digit(&bytes, WINDOW_BITS, WIDE_REPR_BYTES),
+        BoothDigit {
+            magnitude: 1,
+            negative: false,
+        }
+    );
+
+    let first_high_bit = {
+        let mut bytes = [0; WIDE_REPR_BYTES];
+        bytes[FIRST_WIDE_BYTE + 1] = 1;
+        bytes
+    };
+    let all_ones = [u8::MAX; WIDE_REPR_BYTES];
+    // Folding into `Fp` avoids a big-integer test dependency while exercising
+    // the complete 320-bit recoding schedule.
+    for bytes in [&bytes, &first_high_bit, &all_ones] {
+        for window_bits in [1, 3, 5, 8, 9] {
+            assert_eq!(
+                evaluate_booth_digits(bytes, window_bits),
+                evaluate_le_bytes(bytes)
+            );
+        }
+    }
+}
+
+#[test]
+fn test_multiexp_booth_boundaries() {
+    let rng = OsRng;
+    let mut fp_high_bit = Fp::ONE;
+    for _ in 0..254 {
+        fp_high_bit = fp_high_bit.double();
+    }
+    let fp_scalars = [
+        Fp::ZERO,
+        Fp::ONE,
+        -Fp::ONE,
+        Fp::from(3),
+        Fp::from(4),
+        Fp::from(7),
+        Fp::from(8),
+        fp_high_bit,
+    ];
+    let fp_coeffs = fp_scalars.into_iter().cycle().take(32).collect::<Vec<_>>();
+    let fp_bases = (0..fp_coeffs.len())
         .map(|_| EqAffine::from(Eq::random(rng)))
         .collect::<Vec<_>>();
+    assert_multiexp_matches_naive(&fp_coeffs, &fp_bases);
 
-    let expected = best_multiexp(&coeffs, &bases);
-    let actual = coeffs
+    let mut fq_high_bit = Fq::ONE;
+    for _ in 0..254 {
+        fq_high_bit = fq_high_bit.double();
+    }
+    let fq_scalars = [
+        Fq::ZERO,
+        Fq::ONE,
+        -Fq::ONE,
+        Fq::from(3),
+        Fq::from(4),
+        Fq::from(7),
+        Fq::from(8),
+        fq_high_bit,
+    ];
+    let fq_coeffs = fq_scalars.into_iter().cycle().take(32).collect::<Vec<_>>();
+    let fq_bases = (0..fq_coeffs.len())
+        .map(|_| EpAffine::from(Ep::random(rng)))
+        .collect::<Vec<_>>();
+    assert_multiexp_matches_naive(&fq_coeffs, &fq_bases);
+}
+
+/// Scalars that stress the signed-digit recoding: zero, small values, values
+/// next to every window size's digit boundaries at several window offsets,
+/// all-ones and alternating bit patterns, top-bit values, and values next to
+/// the field modulus.
+#[cfg(test)]
+fn multiexp_edge_scalars<F: PrimeField>() -> Vec<F> {
+    let pow2 = |e: usize| (0..e).fold(F::ONE, |acc, _| acc.double());
+    let mut scalars = vec![F::ZERO, F::ONE, -F::ONE, F::from(2), -F::from(2)];
+    for c in 1..=13 {
+        for shift in [0, c, 3 * c, 64, 128 - c, 250 - c] {
+            let base = pow2(shift);
+            for v in [
+                pow2(c) - F::ONE,
+                pow2(c),
+                pow2(c - 1) - F::ONE,
+                pow2(c - 1),
+                pow2(c - 1) + F::ONE,
+            ] {
+                scalars.push(v * base);
+                scalars.push(-(v * base));
+            }
+        }
+    }
+    let bits = F::NUM_BITS as usize;
+    let top = pow2(bits - 1);
+    scalars.extend([top, top - F::ONE, top + F::ONE, -top, pow2(bits - 2)]);
+    // Byte patterns over the low `bits - 1` bits, so they are always canonical.
+    let pattern_bits = bits - 1;
+    for pattern in [0xffu8, 0x80, 0x7f, 0xaa, 0x55, 0x01, 0xfe] {
+        let mut repr = F::Repr::default();
+        for (i, byte) in repr.as_mut().iter_mut().enumerate() {
+            let bit_start = i * 8;
+            if bit_start + 8 <= pattern_bits {
+                *byte = pattern;
+            } else if bit_start < pattern_bits {
+                *byte = pattern & ((1u8 << (pattern_bits - bit_start)) - 1);
+            }
+        }
+        let value = F::from_repr(repr).unwrap();
+        scalars.extend([value, -value]);
+    }
+    scalars
+}
+
+/// Bases with identities, repeated points (bucket doublings) and negated
+/// points (bucket cancellations) mixed into random points.
+#[cfg(test)]
+fn multiexp_test_bases<C: CurveAffine>(len: usize) -> Vec<C> {
+    let rng = OsRng;
+    let mut bases: Vec<C> = (0..len)
+        .map(|_| C::Curve::random(rng).to_affine())
+        .collect();
+    for i in 0..len {
+        match i % 11 {
+            4 => bases[i] = C::identity(),
+            7 => bases[i] = bases[i / 2],
+            9 => bases[i] = -bases[i / 3],
+            _ => {}
+        }
+    }
+    bases
+}
+
+/// Checks `best_multiexp` against the naive sum for many lengths, under
+/// several thread counts (which also moves the serial/parallel threshold), for
+/// a mix of random and edge-case scalars.
+#[cfg(test)]
+fn check_multiexp_sizes_and_threads<C: CurveAffine>(lengths: &[usize], thread_counts: &[usize]) {
+    let rng = OsRng;
+    let edge = multiexp_edge_scalars::<C::Scalar>();
+    let pools: Vec<_> = thread_counts
         .iter()
-        .zip(bases)
-        .map(|(coeff, base)| base * coeff)
-        .fold(Eq::identity(), |acc, val| acc + val);
+        .map(|&threads| {
+            maybe_rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+        })
+        .collect();
 
-    assert_eq!(expected, actual);
+    for (round, &len) in lengths.iter().enumerate() {
+        let bases = multiexp_test_bases::<C>(len);
+        let coeff_sets: [Vec<C::Scalar>; 4] = [
+            (0..len).map(|_| C::Scalar::random(rng)).collect(),
+            // Edge scalars at rotating offsets interleaved with random ones.
+            (0..len)
+                .map(|i| {
+                    if i % 3 == 2 {
+                        C::Scalar::random(rng)
+                    } else {
+                        edge[(i + round * 7) % edge.len()]
+                    }
+                })
+                .collect(),
+            // All scalars identical (every point lands in the same buckets).
+            vec![edge[(round * 5 + 3) % edge.len()]; len],
+            vec![C::Scalar::ZERO; len],
+        ];
+        for coeffs in coeff_sets.iter() {
+            let expected = naive_multiexp(coeffs, &bases);
+            for pool in &pools {
+                assert_eq!(
+                    pool.install(|| best_multiexp(coeffs, &bases)),
+                    expected,
+                    "len {}",
+                    len
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_multiexp_sizes_and_threads() {
+    let mut lengths: Vec<usize> = (0..=40).collect();
+    lengths.extend([
+        63, 64, 65, 127, 128, 129, 255, 256, 257, 1023, 1024, 1025, 2049,
+    ]);
+    let thread_counts = [1, 2, 3, 6, 14, 64];
+    check_multiexp_sizes_and_threads::<EqAffine>(&lengths, &thread_counts);
+    check_multiexp_sizes_and_threads::<EpAffine>(
+        &[0, 1, 2, 3, 4, 13, 31, 32, 33, 100, 2048],
+        &thread_counts,
+    );
+}
+
+#[test]
+fn test_multiexp_wide_windows() {
+    // The window size is ceil(ln n): 8 up to n = 2980, 9 from n = 2981 and 10
+    // from n = 8104. Cover the wider windows that large (e.g. batched)
+    // verifier MSMs use.
+    check_multiexp_sizes_and_threads::<EqAffine>(&[2980, 2981, 8104], &[1, 6]);
+}
+
+#[test]
+fn test_multiexp_edge_scalars() {
+    // Every edge scalar on its own, so that a wrong digit cannot be masked by
+    // the other terms of the sum.
+    let rng = OsRng;
+    let base = EqAffine::from(Eq::random(rng));
+    for scalar in multiexp_edge_scalars::<Fp>() {
+        for len in [1, 2, 4, 32, 33, 64] {
+            let coeffs = vec![scalar; len];
+            let mut bases = vec![EqAffine::identity(); len];
+            bases[len - 1] = base;
+            assert_eq!(best_multiexp(&coeffs, &bases), base * scalar);
+        }
+    }
 }
 
 #[test]

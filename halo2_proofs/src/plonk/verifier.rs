@@ -93,11 +93,14 @@ pub fn verify_proof<
                     if instance.len() > params.n as usize - (vk.cs.blinding_factors() + 1) {
                         return Err(Error::InstanceTooLarge);
                     }
-                    let mut poly = instance.to_vec();
-                    poly.resize(params.n as usize, C::Scalar::ZERO);
-                    let poly = vk.domain.lagrange_from_vec(poly);
-
-                    Ok(params.commit_lagrange(&poly, Blind::default()).to_affine())
+                    // Zero-padding to the domain used to check this
+                    // implicitly; keep the check.
+                    assert_eq!(params.n as usize, vk.domain.len());
+                    // Equal to committing to `instance` zero-padded to the
+                    // domain, without the work for the zero padding.
+                    Ok(params
+                        .commit_lagrange_prefix(instance, Blind::default())
+                        .to_affine())
                 })
                 .collect::<Result<Vec<_>, _>>()
         })
