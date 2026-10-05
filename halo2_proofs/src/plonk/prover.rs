@@ -458,35 +458,59 @@ where
     // Sample theta challenge for keeping lookup columns linearly independent
     let theta: ChallengeTheta<_> = transcript.squeeze_challenge_scalar();
 
-    let lookups: Vec<Vec<lookup::prover::Permuted<C, _>>> = instance_values
+    // Draw the randomness for every lookup argument of every circuit up front, in
+    // the order in which it has always been drawn. The permuted values can then be
+    // constructed and committed to for all lookups concurrently; the commitments
+    // are written to the transcript afterwards in the original order.
+    let lookup_blindings: Vec<Vec<_>> = circuits
         .iter()
-        .zip(instance_cosets.iter())
-        .zip(advice_values.iter())
-        .zip(advice_cosets.iter())
-        .map(|(((instance_values, instance_cosets), advice_values), advice_cosets)| -> Result<Vec<_>, Error> {
-            // Construct and commit to permuted values for each lookup
-            pk.vk
-                .cs
-                .lookups
+        .map(|_| {
+            meta.lookups
                 .iter()
-                .map(|lookup| {
-                    lookup.commit_permuted(
-                        pk,
-                        params,
-                        domain,
-                        &value_evaluator,
-                        &mut coset_evaluator,
-                        theta,
-                        advice_values,
-                        &fixed_values,
-                        instance_values,
-                        advice_cosets,
-                        &fixed_cosets,
-                        instance_cosets,
-                        &mut rng,
-                        transcript,
-                    )
-                })
+                .map(|_| lookup::prover::PermutedBlinding::draw(meta.blinding_factors(), &mut rng))
+                .collect()
+        })
+        .collect();
+
+    let lookups: Vec<Vec<_>> = (&instance_values)
+        .into_par_iter()
+        .zip((&instance_cosets).into_par_iter())
+        .zip((&advice_values).into_par_iter())
+        .zip((&advice_cosets).into_par_iter())
+        .zip(lookup_blindings.into_par_iter())
+        .map(
+            |((((instance_values, instance_cosets), advice_values), advice_cosets), blindings)| {
+                // Construct and commit to permuted values for each lookup
+                (&meta.lookups)
+                    .into_par_iter()
+                    .zip(blindings.into_par_iter())
+                    .map(|(lookup, blinding)| {
+                        lookup.commit_permuted(
+                            pk,
+                            params,
+                            domain,
+                            &value_evaluator,
+                            theta,
+                            advice_values,
+                            &fixed_values,
+                            instance_values,
+                            advice_cosets,
+                            &fixed_cosets,
+                            instance_cosets,
+                            blinding,
+                        )
+                    })
+                    .collect()
+            },
+        )
+        .collect();
+
+    let lookups: Vec<Vec<lookup::prover::Permuted<C, _>>> = lookups
+        .into_iter()
+        .map(|lookups: Vec<_>| -> Result<Vec<_>, Error> {
+            lookups
+                .into_iter()
+                .map(|lookup| lookup?.finish(&mut coset_evaluator, transcript))
                 .collect()
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -497,11 +521,19 @@ where
     // Sample gamma challenge
     let gamma: ChallengeGamma<_> = transcript.squeeze_challenge_scalar();
 
-    // Commit to permutations.
-    let permutations: Vec<permutation::prover::Committed<C, _>> = instance
+    // Commit to permutations. As for the lookups above, the randomness is drawn
+    // up front in the original order, the grand products of all circuits are
+    // committed to concurrently, and the commitments are written to the transcript
+    // in the original order.
+    let permutation_blindings: Vec<_> = circuits
         .iter()
-        .zip(advice.iter())
-        .map(|(instance, advice)| {
+        .map(|_| pk.vk.cs.permutation.draw_blinding(pk, &mut rng))
+        .collect();
+    let permutations: Vec<_> = (&instance)
+        .into_par_iter()
+        .zip((&advice).into_par_iter())
+        .zip(permutation_blindings.into_par_iter())
+        .map(|((instance, advice), blinding)| {
             pk.vk.cs.permutation.commit(
                 params,
                 pk,
@@ -511,31 +543,43 @@ where
                 &instance.instance_values,
                 beta,
                 gamma,
-                &mut coset_evaluator,
-                &mut rng,
-                transcript,
+                blinding,
             )
         })
+        .collect();
+    let permutations: Vec<permutation::prover::Committed<C, _>> = permutations
+        .into_iter()
+        .map(|permutation| permutation.finish(&mut coset_evaluator, transcript))
         .collect::<Result<Vec<_>, _>>()?;
 
+    // Construct and commit to products for each lookup, in the same way.
+    let product_blindings: Vec<Vec<_>> = lookups
+        .iter()
+        .map(|lookups| {
+            lookups
+                .iter()
+                .map(|_| lookup::prover::ProductBlinding::draw(meta.blinding_factors(), &mut rng))
+                .collect()
+        })
+        .collect();
+    let lookups: Vec<Vec<_>> = lookups
+        .into_par_iter()
+        .zip(product_blindings.into_par_iter())
+        .map(|(lookups, blindings)| {
+            lookups
+                .into_par_iter()
+                .zip(blindings.into_par_iter())
+                .map(|(lookup, blinding)| lookup.commit_product(pk, params, beta, gamma, blinding))
+                .collect()
+        })
+        .collect();
     let lookups: Vec<Vec<lookup::prover::Committed<C, _>>> = lookups
         .into_iter()
-        .map(|lookups| -> Result<Vec<_>, _> {
-            // Construct and commit to products for each lookup
+        .map(|lookups: Vec<_>| -> Result<Vec<_>, Error> {
             lookups
                 .into_iter()
-                .map(|lookup| {
-                    lookup.commit_product(
-                        pk,
-                        params,
-                        beta,
-                        gamma,
-                        &mut coset_evaluator,
-                        &mut rng,
-                        transcript,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()
+                .map(|lookup| lookup.finish(&mut coset_evaluator, transcript))
+                .collect()
         })
         .collect::<Result<Vec<_>, _>>()?;
 

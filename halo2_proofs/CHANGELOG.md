@@ -7,11 +7,13 @@ and this project adheres to Rust's notion of
 
 ## [Unreleased]
 ### Changed
-- `halo2_proofs::plonk::create_proof` now synthesizes the witnesses of all
-  circuits concurrently (when the `multicore` feature is enabled) before
-  blinding and committing to them. Randomness is drawn and the transcript is
-  written in the same order as before, so for a given RNG the proof bytes are
-  unchanged.
+- `halo2_proofs::plonk::create_proof` now processes the circuits of a
+  multi-circuit proof concurrently (when the `multicore` feature is enabled):
+  witness synthesis, advice blinding and commitments, the lookup arguments'
+  permuted and grand-product commitments, and the permutation argument's
+  grand-product commitments (with their FFTs) run for all circuits at once.
+  Randomness is drawn and the transcript is written in the same order as
+  before, so for a given RNG the proof bytes are unchanged.
 - `halo2_proofs::plonk::create_proof` now has additional trait bounds:
   - `ConcreteCircuit: Sync`
   - `ConcreteCircuit::Config: Send`
