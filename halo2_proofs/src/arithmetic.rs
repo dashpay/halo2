@@ -9,7 +9,7 @@ use group::{
 use maybe_rayon::prelude::*;
 pub use pasta_curves::arithmetic::*;
 
-use crate::multicore::{self, TheBestReduce};
+use crate::multicore;
 
 /// This represents an element of a group with basic operations that can be
 /// performed. This allows an FFT implementation (for example) to operate
@@ -212,30 +212,35 @@ pub fn best_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Cu
     let mut multi_buckets: Vec<BoothBuckets<C>> =
         vec![BoothBuckets::new(c); booth_window_count(&coeffs, c)];
     let num_threads = multicore::current_num_threads();
-    if coeffs.len() > num_threads {
+    let window_sums: Vec<C::Curve> = if coeffs.len() > num_threads {
         multi_buckets
             .par_iter_mut()
             .enumerate()
-            .rev()
-            .map(|(i, buckets)| {
-                let mut acc = buckets.sum(&coeffs, bases, i);
-                (0..c * i).for_each(|_| acc = acc.double());
-                acc
-            })
-            .the_best_reduce(C::Curve::identity, |a, b| a + b)
-            .expect("multi_buckets always contains at least 1 bucket")
+            .map(|(i, buckets)| buckets.sum(&coeffs, bases, i))
+            .collect()
     } else {
         multi_buckets
             .iter_mut()
             .enumerate()
-            .rev()
             .map(|(i, buckets)| buckets.sum(&coeffs, bases, i))
-            .fold(C::Curve::identity(), |mut sum, bucket| {
-                // restore original evaluation point
-                (0..c).for_each(|_| sum = sum.double());
-                sum + bucket
-            })
+            .collect()
+    };
+
+    // Combine the window sums with Horner's rule, from the most significant
+    // window down: acc = acc * 2^c + window_sum. This costs c doublings per
+    // window in total, rather than c * i doublings for window i if each
+    // window were shifted into place independently.
+    let mut window_sums = window_sums.into_iter().rev();
+    let mut acc = window_sums
+        .next()
+        .expect("multi_buckets always contains at least 1 window");
+    for window_sum in window_sums {
+        for _ in 0..c {
+            acc = acc.double();
+        }
+        acc += window_sum;
     }
+    acc
 }
 
 /// Performs a radix-$2$ Fast-Fourier Transformation (FFT) on a vector of size
