@@ -9,6 +9,12 @@ and this project adheres to Rust's notion of
 ### Changed
 - MSRV is now 1.63.0.
 - Bumped `pasta_curves` to 0.5.2 and enabled its `glv` feature.
+- `halo2_proofs::arithmetic::best_multiexp` now uses signed Booth recoding to
+  halve its Pippenger bucket count. It computes each scalar's canonical
+  representation once per MSM rather than once per window, derives its window
+  schedule from that representation instead of assuming a 256-bit scalar, and
+  combines the per-window sums with Horner's rule in the multithreaded case
+  too. Results are unchanged.
 - `halo2_proofs::poly::commitment::create_proof` (the IPA opening, also used
   by `halo2_proofs::plonk::create_proof`) collapses the generator vector with
   `pasta_curves`' variable-time GLV scalar multiplication when the curve is
