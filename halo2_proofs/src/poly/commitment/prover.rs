@@ -6,9 +6,15 @@ use super::{Blind, Params};
 use crate::arithmetic::{
     best_multiexp, compute_inner_product, eval_polynomial, parallelize, CurveAffine,
 };
+use crate::multicore;
+use crate::pasta::{
+    glv::{Decomposed, GlvParams, Table},
+    pallas, vesta,
+};
 use crate::transcript::{EncodedChallenge, TranscriptWrite};
 
-use group::Curve;
+use group::{prime::PrimeCurveAffine, Curve};
+use std::any::Any;
 use std::io;
 
 /// Create a polynomial commitment opening proof for the polynomial defined
@@ -101,17 +107,24 @@ pub fn create_proof<
         let half = 1 << (params.k - j - 1); // half the length of `p_prime`, `b`, `G'`
 
         // Compute L, R
-        //
-        // TODO: If we modify multiexp to take "extra" bases, we could speed
-        // this piece up a bit by combining the multiexps.
-        let l_j = best_multiexp(&p_prime[half..], &g_prime[0..half]);
-        let r_j = best_multiexp(&p_prime[0..half], &g_prime[half..]);
         let value_l_j = compute_inner_product(&p_prime[half..], &b[0..half]);
         let value_r_j = compute_inner_product(&p_prime[0..half], &b[half..]);
         let l_j_randomness = C::Scalar::random(&mut rng);
         let r_j_randomness = C::Scalar::random(&mut rng);
-        let l_j = l_j + &best_multiexp(&[value_l_j * &z, l_j_randomness], &[params.u, params.w]);
-        let r_j = r_j + &best_multiexp(&[value_r_j * &z, r_j_randomness], &[params.u, params.w]);
+        let l_j = multiexp_with_u_w(
+            params,
+            &p_prime[half..],
+            &g_prime[0..half],
+            value_l_j * &z,
+            l_j_randomness,
+        );
+        let r_j = multiexp_with_u_w(
+            params,
+            &p_prime[0..half],
+            &g_prime[half..],
+            value_r_j * &z,
+            r_j_randomness,
+        );
         let l_j = l_j.to_affine();
         let r_j = r_j.to_affine();
 
@@ -151,7 +164,48 @@ pub fn create_proof<
     Ok(())
 }
 
-fn parallel_generator_collapse<C: CurveAffine>(g: &mut [C], challenge: C::Scalar) {
+/// Computes `<scalars, bases> + [u_scalar] U + [w_scalar] W` as a single
+/// multiexp. (A separate two-term multiexp for the `U` and `W` terms costs
+/// about as much as a full-width scalar multiplication, i.e. more than the
+/// two extra terms add to the main multiexp.)
+fn multiexp_with_u_w<C: CurveAffine>(
+    params: &Params<C>,
+    scalars: &[C::Scalar],
+    bases: &[C],
+    u_scalar: C::Scalar,
+    w_scalar: C::Scalar,
+) -> C::Curve {
+    let mut all_scalars = Vec::with_capacity(scalars.len() + 2);
+    all_scalars.extend_from_slice(scalars);
+    all_scalars.extend([u_scalar, w_scalar]);
+
+    let mut all_bases = Vec::with_capacity(bases.len() + 2);
+    all_bases.extend_from_slice(bases);
+    all_bases.extend([params.u, params.w]);
+
+    best_multiexp(&all_scalars, &all_bases)
+}
+
+/// Collapses the generator vector `g` of even length `2m` in place, so that its
+/// first `m` entries become `g[i] + challenge * g[m + i]`. The caller truncates
+/// `g` to `m` entries afterwards.
+///
+/// `challenge` is a public Fiat-Shamir challenge and `g` is derived only from
+/// the public parameters and earlier public challenges, so variable-time scalar
+/// multiplication is acceptable here: nothing secret flows into this function.
+fn parallel_generator_collapse<C: CurveAffine>(g: &mut Vec<C>, challenge: C::Scalar) {
+    // Pallas and Vesta (the only curves `halo2_proofs` is used with in
+    // practice) take the GLV path; any other curve keeps the generic one.
+    if !glv_generator_collapse::<C, vesta::Point>(g, &challenge)
+        && !glv_generator_collapse::<C, pallas::Point>(g, &challenge)
+    {
+        generic_generator_collapse(g, challenge);
+    }
+}
+
+/// The original, curve-agnostic collapse, using the curve implementation's
+/// (double-and-add) scalar multiplication.
+fn generic_generator_collapse<C: CurveAffine>(g: &mut [C], challenge: C::Scalar) {
     let len = g.len() / 2;
     let (g_lo, g_hi) = g.split_at_mut(len);
 
@@ -163,4 +217,155 @@ fn parallel_generator_collapse<C: CurveAffine>(g: &mut [C], challenge: C::Scalar
         }
         C::Curve::batch_normalize(&tmp, g_lo);
     });
+}
+
+/// Minimum number of points handled by one task of [`glv_generator_collapse`].
+/// A GLV multiplication costs tens of microseconds, so even small chunks
+/// amortize the task overhead and the one field inversion per chunk, and the
+/// later IPA rounds (which have few points) still run in parallel.
+const GLV_COLLAPSE_MIN_CHUNK: usize = 4;
+
+/// Generator collapse using `pasta_curves`' variable-time GLV multiplication,
+/// if `C` is the affine form of `P`. Returns `false`, leaving `g` untouched,
+/// if it is not.
+///
+/// The challenge is decomposed once per round and shared by every point; each
+/// point's table of odd multiples of `P` and `phi(P)` is built in batches that
+/// share a single field inversion. The results are exact group elements, so
+/// the collapsed (normalized) vector is identical to the generic path's.
+// `g` is a `Vec` rather than a slice because only sized types can be
+// downcast through `Any`.
+#[allow(clippy::ptr_arg)]
+fn glv_generator_collapse<C: CurveAffine, P: GlvParams>(
+    g: &mut Vec<C>,
+    challenge: &C::Scalar,
+) -> bool {
+    let (g, challenge) = match (
+        (g as &mut dyn Any).downcast_mut::<Vec<P::AffineExt>>(),
+        (challenge as &dyn Any).downcast_ref::<P::ScalarExt>(),
+    ) {
+        (Some(g), Some(challenge)) => (g, challenge),
+        _ => return false,
+    };
+
+    let half = g.len() / 2;
+    let (g_lo, g_hi) = g.split_at_mut(half);
+    let decomposed = Decomposed::<P>::new(challenge);
+    let decomposed = &decomposed;
+
+    let num_threads = multicore::current_num_threads();
+    let chunk = ((half + num_threads - 1) / num_threads).max(GLV_COLLAPSE_MIN_CHUNK);
+    multicore::scope(|scope| {
+        for (g_lo, g_hi) in g_lo.chunks_mut(chunk).zip(g_hi.chunks(chunk)) {
+            scope.spawn(move |_| {
+                let g_hi: Vec<P> = g_hi.iter().map(PrimeCurveAffine::to_curve).collect();
+                let collapsed: Vec<P> = Table::batch(&g_hi)
+                    .iter()
+                    .zip(g_lo.iter())
+                    .map(|(table, g_lo)| table.mul_decomposed(decomposed) + g_lo)
+                    .collect();
+                P::batch_normalize(&collapsed, g_lo);
+            });
+        }
+    });
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{generic_generator_collapse, glv_generator_collapse, parallel_generator_collapse};
+    use crate::arithmetic::CurveAffine;
+    use crate::pasta::{pallas, vesta, EpAffine, EqAffine, Fp};
+    use ff::Field;
+    use group::{Curve, Group};
+    use rand_core::OsRng;
+
+    /// `g_lo[i] + challenge * g_hi[i]`, computed point by point.
+    fn naive_collapse<C: CurveAffine>(g: &[C], challenge: C::Scalar) -> Vec<C> {
+        let (g_lo, g_hi) = g.split_at(g.len() / 2);
+        g_lo.iter()
+            .zip(g_hi.iter())
+            .map(|(lo, hi)| (lo.to_curve() + *hi * challenge).to_affine())
+            .collect()
+    }
+
+    fn check_collapse<C: CurveAffine>() {
+        let mut high_bit = C::Scalar::ONE;
+        for _ in 0..254 {
+            high_bit = high_bit.double();
+        }
+        let challenges = [
+            C::Scalar::ZERO,
+            C::Scalar::ONE,
+            -C::Scalar::ONE,
+            C::Scalar::from(2),
+            C::Scalar::from(u64::MAX),
+            high_bit,
+            -high_bit,
+            C::Scalar::random(OsRng),
+            C::Scalar::random(OsRng),
+        ];
+        for len in [2usize, 4, 6, 8, 16, 30, 64, 130, 512, 2048] {
+            let mut g: Vec<C> = (0..len)
+                .map(|i| match i % 7 {
+                    // Identity entries in both halves.
+                    3 => C::identity(),
+                    // A low/high pair that may cancel for challenge = -1.
+                    5 => C::generator(),
+                    _ => C::Curve::random(OsRng).to_affine(),
+                })
+                .collect();
+            if len >= 4 {
+                g[len / 2] = g[0];
+                g[len / 2 + 1] = -g[1];
+            }
+            for challenge in challenges {
+                let expected = naive_collapse(&g, challenge);
+
+                let mut generic = g.clone();
+                generic_generator_collapse(&mut generic, challenge);
+                assert_eq!(&generic[..len / 2], &expected[..]);
+
+                let mut fast = g.clone();
+                parallel_generator_collapse(&mut fast, challenge);
+                assert_eq!(&fast[..len / 2], &expected[..]);
+                // The upper half is left for the caller to truncate.
+                assert_eq!(&fast[len / 2..], &g[len / 2..]);
+            }
+        }
+    }
+
+    #[test]
+    fn glv_generator_collapse_dispatch() {
+        let g: Vec<EqAffine> = (0..8)
+            .map(|_| vesta::Point::random(OsRng).to_affine())
+            .collect();
+        let challenge = Fp::random(OsRng);
+
+        // A mismatched curve is rejected without touching the generators.
+        let mut mismatched = g.clone();
+        assert!(!glv_generator_collapse::<EqAffine, pallas::Point>(
+            &mut mismatched,
+            &challenge
+        ));
+        assert_eq!(mismatched, g);
+
+        // The matching curve takes the GLV path.
+        let mut collapsed = g.clone();
+        assert!(glv_generator_collapse::<EqAffine, vesta::Point>(
+            &mut collapsed,
+            &challenge
+        ));
+        assert_eq!(&collapsed[..4], &naive_collapse(&g, challenge)[..]);
+    }
+
+    #[test]
+    fn generator_collapse_matches_naive_vesta() {
+        check_collapse::<EqAffine>();
+    }
+
+    #[test]
+    fn generator_collapse_matches_naive_pallas() {
+        check_collapse::<EpAffine>();
+    }
 }

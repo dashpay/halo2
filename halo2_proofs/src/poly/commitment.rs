@@ -149,6 +149,32 @@ impl<C: CurveAffine> Params<C> {
         best_multiexp::<C>(&tmp_scalars, &tmp_bases)
     }
 
+    /// Commits to the polynomial whose evaluations over the $2^k$ size
+    /// evaluation domain are `values` followed by zeroes, blinded by `r`.
+    ///
+    /// This equals [`Params::commit_lagrange`] applied to `values`
+    /// zero-padded to the domain size, but only spends work on the supplied
+    /// prefix: zero evaluations contribute nothing to the commitment. Used for
+    /// instance columns, which are usually much shorter than the domain.
+    ///
+    /// Panics if `values` is longer than the domain.
+    pub(crate) fn commit_lagrange_prefix(
+        &self,
+        values: &[C::Scalar],
+        r: Blind<C::Scalar>,
+    ) -> C::Curve {
+        let mut tmp_scalars = Vec::with_capacity(values.len() + 1);
+        let mut tmp_bases = Vec::with_capacity(values.len() + 1);
+
+        tmp_scalars.extend(values);
+        tmp_scalars.push(r.0);
+
+        tmp_bases.extend(&self.g_lagrange[..values.len()]);
+        tmp_bases.push(self.w);
+
+        best_multiexp::<C>(&tmp_scalars, &tmp_bases)
+    }
+
     /// Generates an empty multiscalar multiplication struct using the
     /// appropriate params.
     pub fn empty_msm(&self) -> MSM<C> {
@@ -276,6 +302,40 @@ fn test_commit_lagrange_epaffine() {
     let alpha = Blind(Fq::random(OsRng));
 
     assert_eq!(params.commit(&b, alpha), params.commit_lagrange(&a, alpha));
+}
+
+#[test]
+fn test_commit_lagrange_prefix() {
+    const K: u32 = 5;
+
+    use crate::pasta::{EqAffine, Fp};
+    use rand_core::OsRng;
+
+    let params = Params::<EqAffine>::new(K);
+    let domain = super::EvaluationDomain::new(1, K);
+
+    for len in [0, 1, 2, 9, 31, 1 << K] {
+        // Include internal zeroes as well as random values.
+        let values: Vec<Fp> = (0..len)
+            .map(|i| {
+                if i % 4 == 1 {
+                    Fp::ZERO
+                } else {
+                    Fp::random(OsRng)
+                }
+            })
+            .collect();
+        let mut padded = domain.empty_lagrange();
+        for (coefficient, value) in padded.iter_mut().zip(values.iter()) {
+            *coefficient = *value;
+        }
+        for blind in [Blind::default(), Blind(Fp::ZERO), Blind(Fp::random(OsRng))] {
+            assert_eq!(
+                params.commit_lagrange_prefix(&values, blind),
+                params.commit_lagrange(&padded, blind),
+            );
+        }
+    }
 }
 
 #[test]
