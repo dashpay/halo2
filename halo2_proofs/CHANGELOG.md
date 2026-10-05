@@ -9,6 +9,11 @@ and this project adheres to Rust's notion of
 ### Changed
 - MSRV is now 1.63.0.
 - Bumped `pasta_curves` to 0.5.2 and enabled its `glv` feature.
+- `halo2_proofs::poly::commitment::create_proof` (the IPA opening, also used
+  by `halo2_proofs::plonk::create_proof`) collapses the generator vector with
+  `pasta_curves`' variable-time GLV scalar multiplication when the curve is
+  Pallas or Vesta. The collapse only multiplies public generators by public
+  Fiat-Shamir challenges; proofs are byte-for-byte unchanged.
 
 ## [0.3.2] - 2025-12-04
 ### Added
