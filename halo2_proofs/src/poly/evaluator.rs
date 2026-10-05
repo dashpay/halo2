@@ -1,5 +1,5 @@
 use std::{
-    cmp, fmt,
+    fmt,
     hash::{Hash, Hasher},
     marker::PhantomData,
     ops::{Add, Mul, MulAssign, Neg, Sub},
@@ -13,6 +13,8 @@ use super::{
     Basis, Coeff, EvaluationDomain, ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, Rotation,
 };
 use crate::multicore;
+
+mod compiled;
 
 /// Returns `(chunk_size, num_chunks)` suitable for processing the given polynomial length
 /// in the current parallelization environment.
@@ -127,6 +129,25 @@ impl<E, F: Field, B: Basis> Evaluator<E, F, B> {
 
     /// Evaluates the given polynomial operation against this context.
     pub(crate) fn evaluate(
+        &self,
+        ast: &Ast<E, F, B>,
+        domain: &EvaluationDomain<F>,
+    ) -> Polynomial<F, B>
+    where
+        E: Copy + Send + Sync,
+        F: WithSmallOrderMulGroup<3>,
+        B: BasisOps,
+    {
+        // We're working in a single basis, so all polynomials are the same length.
+        let poly_len = self.polys.first().unwrap().len();
+        compiled::Program::compile(ast, poly_len, B::rotation_scale(domain))
+            .evaluate(&self.polys, domain)
+    }
+
+    /// Evaluates the given polynomial operation against this context by recursively
+    /// walking the [`Ast`]. This is the original evaluator, kept as a reference for tests.
+    #[cfg(test)]
+    pub(crate) fn evaluate_recursive(
         &self,
         ast: &Ast<E, F, B>,
         domain: &EvaluationDomain<F>,
@@ -441,15 +462,31 @@ impl<E: Clone, F: Field> MulAssign for Ast<E, F, ExtendedLagrangeCoeff> {
 
 /// Operations which can be performed over a given basis.
 pub(crate) trait BasisOps: Basis {
+    /// Whether a constant polynomial has the same value at every index in this basis.
+    const CONSTANT_IS_UNIFORM: bool;
+    /// The index shift corresponding to a rotation by one row, or `None` if polynomials in
+    /// this basis cannot be rotated.
+    fn rotation_scale<F: WithSmallOrderMulGroup<3>>(domain: &EvaluationDomain<F>) -> Option<usize>;
+    /// Returns `(x_0, omega)` such that the degree-1 polynomial `X` has the value
+    /// `x_0 * omega^i` at index `i`, or `None` if it is not a geometric sequence in this
+    /// basis.
+    fn x_geometric<F: WithSmallOrderMulGroup<3>>(domain: &EvaluationDomain<F>) -> Option<(F, F)>;
+    /// The value of the degree-1 polynomial `X` at index `i`, for bases where
+    /// [`BasisOps::x_geometric`] returns `None`.
+    fn x_at_row<F: Field>(_i: usize) -> F {
+        unreachable!("X is a geometric sequence in this basis")
+    }
     fn empty_poly<F: WithSmallOrderMulGroup<3>>(
         domain: &EvaluationDomain<F>,
     ) -> Polynomial<F, Self>;
+    #[cfg(test)]
     fn constant_term<F: Field>(
         poly_len: usize,
         chunk_size: usize,
         chunk_index: usize,
         scalar: F,
     ) -> Vec<F>;
+    #[cfg(test)]
     fn linear_term<F: WithSmallOrderMulGroup<3>>(
         domain: &EvaluationDomain<F>,
         poly_len: usize,
@@ -457,6 +494,7 @@ pub(crate) trait BasisOps: Basis {
         chunk_index: usize,
         scalar: F,
     ) -> Vec<F>;
+    #[cfg(test)]
     fn get_chunk_of_rotated<F: WithSmallOrderMulGroup<3>>(
         domain: &EvaluationDomain<F>,
         chunk_size: usize,
@@ -467,25 +505,46 @@ pub(crate) trait BasisOps: Basis {
 }
 
 impl BasisOps for Coeff {
+    const CONSTANT_IS_UNIFORM: bool = false;
+
+    fn rotation_scale<F: WithSmallOrderMulGroup<3>>(_: &EvaluationDomain<F>) -> Option<usize> {
+        None
+    }
+
+    fn x_geometric<F: WithSmallOrderMulGroup<3>>(_: &EvaluationDomain<F>) -> Option<(F, F)> {
+        None
+    }
+
+    fn x_at_row<F: Field>(i: usize) -> F {
+        if i == 1 {
+            F::ONE
+        } else {
+            F::ZERO
+        }
+    }
+
     fn empty_poly<F: WithSmallOrderMulGroup<3>>(
         domain: &EvaluationDomain<F>,
     ) -> Polynomial<F, Self> {
         domain.empty_coeff()
     }
 
+    #[cfg(test)]
     fn constant_term<F: Field>(
         poly_len: usize,
         chunk_size: usize,
         chunk_index: usize,
         scalar: F,
     ) -> Vec<F> {
-        let mut chunk = vec![F::ZERO; cmp::min(chunk_size, poly_len - chunk_size * chunk_index)];
+        let mut chunk =
+            vec![F::ZERO; std::cmp::min(chunk_size, poly_len - chunk_size * chunk_index)];
         if chunk_index == 0 {
             chunk[0] = scalar;
         }
         chunk
     }
 
+    #[cfg(test)]
     fn linear_term<F: WithSmallOrderMulGroup<3>>(
         _: &EvaluationDomain<F>,
         poly_len: usize,
@@ -493,21 +552,25 @@ impl BasisOps for Coeff {
         chunk_index: usize,
         scalar: F,
     ) -> Vec<F> {
-        let mut chunk = vec![F::ZERO; cmp::min(chunk_size, poly_len - chunk_size * chunk_index)];
+        let mut chunk =
+            vec![F::ZERO; std::cmp::min(chunk_size, poly_len - chunk_size * chunk_index)];
         // If the chunk size is 1 (e.g. if we have a small k and many threads), then the
         // linear coefficient is the second chunk. Otherwise, the chunk size is greater
         // than one, and the linear coefficient is the second element of the first chunk.
         // Note that we check against the original chunk size, not the potentially-short
         // actual size of the current chunk, because we want to know whether the size of
         // the previous chunk was 1.
-        if chunk_size == 1 && chunk_index == 1 {
-            chunk[0] = scalar;
+        if chunk_size == 1 {
+            if chunk_index == 1 {
+                chunk[0] = scalar;
+            }
         } else if chunk_index == 0 {
             chunk[1] = scalar;
         }
         chunk
     }
 
+    #[cfg(test)]
     fn get_chunk_of_rotated<F: WithSmallOrderMulGroup<3>>(
         _: &EvaluationDomain<F>,
         _: usize,
@@ -520,21 +583,33 @@ impl BasisOps for Coeff {
 }
 
 impl BasisOps for LagrangeCoeff {
+    const CONSTANT_IS_UNIFORM: bool = true;
+
+    fn rotation_scale<F: WithSmallOrderMulGroup<3>>(_: &EvaluationDomain<F>) -> Option<usize> {
+        Some(1)
+    }
+
+    fn x_geometric<F: WithSmallOrderMulGroup<3>>(domain: &EvaluationDomain<F>) -> Option<(F, F)> {
+        Some((F::ONE, domain.get_omega()))
+    }
+
     fn empty_poly<F: WithSmallOrderMulGroup<3>>(
         domain: &EvaluationDomain<F>,
     ) -> Polynomial<F, Self> {
         domain.empty_lagrange()
     }
 
+    #[cfg(test)]
     fn constant_term<F: Field>(
         poly_len: usize,
         chunk_size: usize,
         chunk_index: usize,
         scalar: F,
     ) -> Vec<F> {
-        vec![scalar; cmp::min(chunk_size, poly_len - chunk_size * chunk_index)]
+        vec![scalar; std::cmp::min(chunk_size, poly_len - chunk_size * chunk_index)]
     }
 
+    #[cfg(test)]
     fn linear_term<F: WithSmallOrderMulGroup<3>>(
         domain: &EvaluationDomain<F>,
         poly_len: usize,
@@ -545,7 +620,7 @@ impl BasisOps for LagrangeCoeff {
         // Take every power of omega within the chunk, and multiply by scalar.
         let omega = domain.get_omega();
         let start = chunk_size * chunk_index;
-        (0..cmp::min(chunk_size, poly_len - start))
+        (0..std::cmp::min(chunk_size, poly_len - start))
             .scan(omega.pow_vartime([start as u64]) * scalar, |acc, _| {
                 let ret = *acc;
                 *acc *= omega;
@@ -554,6 +629,7 @@ impl BasisOps for LagrangeCoeff {
             .collect()
     }
 
+    #[cfg(test)]
     fn get_chunk_of_rotated<F: WithSmallOrderMulGroup<3>>(
         _: &EvaluationDomain<F>,
         chunk_size: usize,
@@ -566,21 +642,33 @@ impl BasisOps for LagrangeCoeff {
 }
 
 impl BasisOps for ExtendedLagrangeCoeff {
+    const CONSTANT_IS_UNIFORM: bool = true;
+
+    fn rotation_scale<F: WithSmallOrderMulGroup<3>>(domain: &EvaluationDomain<F>) -> Option<usize> {
+        Some(domain.extended_rotation_scale())
+    }
+
+    fn x_geometric<F: WithSmallOrderMulGroup<3>>(domain: &EvaluationDomain<F>) -> Option<(F, F)> {
+        Some((F::ZETA, domain.get_extended_omega()))
+    }
+
     fn empty_poly<F: WithSmallOrderMulGroup<3>>(
         domain: &EvaluationDomain<F>,
     ) -> Polynomial<F, Self> {
         domain.empty_extended()
     }
 
+    #[cfg(test)]
     fn constant_term<F: Field>(
         poly_len: usize,
         chunk_size: usize,
         chunk_index: usize,
         scalar: F,
     ) -> Vec<F> {
-        vec![scalar; cmp::min(chunk_size, poly_len - chunk_size * chunk_index)]
+        vec![scalar; std::cmp::min(chunk_size, poly_len - chunk_size * chunk_index)]
     }
 
+    #[cfg(test)]
     fn linear_term<F: WithSmallOrderMulGroup<3>>(
         domain: &EvaluationDomain<F>,
         poly_len: usize,
@@ -591,7 +679,7 @@ impl BasisOps for ExtendedLagrangeCoeff {
         // Take every power of the extended omega within the chunk, and multiply by scalar.
         let omega = domain.get_extended_omega();
         let start = chunk_size * chunk_index;
-        (0..cmp::min(chunk_size, poly_len - start))
+        (0..std::cmp::min(chunk_size, poly_len - start))
             .scan(
                 omega.pow_vartime([start as u64]) * F::ZETA * scalar,
                 |acc, _| {
@@ -603,6 +691,7 @@ impl BasisOps for ExtendedLagrangeCoeff {
             .collect()
     }
 
+    #[cfg(test)]
     fn get_chunk_of_rotated<F: WithSmallOrderMulGroup<3>>(
         domain: &EvaluationDomain<F>,
         chunk_size: usize,
@@ -616,11 +705,18 @@ impl BasisOps for ExtendedLagrangeCoeff {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use group::ff::Field;
     use pasta_curves::pallas;
 
-    use super::{get_chunk_params, new_evaluator, Ast, BasisOps, Evaluator};
-    use crate::poly::{Coeff, EvaluationDomain, ExtendedLagrangeCoeff, LagrangeCoeff};
+    use super::{
+        compiled::Program, get_chunk_params, new_evaluator, Ast, AstLeaf, AstMul, BasisOps,
+        Evaluator,
+    };
+    use crate::poly::{
+        Coeff, EvaluationDomain, ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, Rotation,
+    };
 
     #[test]
     fn short_chunk_regression_test() {
@@ -659,5 +755,228 @@ mod tests {
         test_case(k, new_evaluator::<_, _, Coeff>(|| {}));
         test_case(k, new_evaluator::<_, _, LagrangeCoeff>(|| {}));
         test_case(k, new_evaluator::<_, _, ExtendedLagrangeCoeff>(|| {}));
+    }
+
+    /// A small deterministic xorshift generator, so failures are reproducible.
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        /// Returns a scalar, often one of the values the compiler special-cases.
+        fn scalar(&mut self) -> pallas::Base {
+            match self.below(6) {
+                0 => pallas::Base::ZERO,
+                1 => pallas::Base::ONE,
+                2 => -pallas::Base::ONE,
+                _ => pallas::Base::from(self.next()) * pallas::Base::from(self.next()),
+            }
+        }
+    }
+
+    /// Generates a random [`Ast`] over `leaves`. Subtrees are frequently shared, both by
+    /// cloning (which shares the `Arc`ed children) and by repeating structurally equal
+    /// queries.
+    fn random_ast<E: Copy, B: BasisOps>(
+        rng: &mut TestRng,
+        leaves: &[AstLeaf<E, B>],
+        max_rotation: i32,
+        mul: bool,
+        depth: usize,
+        pool: &mut Vec<Ast<E, pallas::Base, B>>,
+    ) -> Ast<E, pallas::Base, B> {
+        if !pool.is_empty() && rng.below(5) == 0 {
+            return pool[rng.below(pool.len())].clone();
+        }
+        let ast = if depth == 0 {
+            match rng.below(4) {
+                0 => Ast::ConstantTerm(rng.scalar()),
+                1 => Ast::LinearTerm(rng.scalar()),
+                _ => {
+                    let leaf = leaves[rng.below(leaves.len())];
+                    let rotation = rng.below(2 * max_rotation as usize + 1) as i32 - max_rotation;
+                    Ast::Poly(leaf.with_rotation(Rotation(rotation)))
+                }
+            }
+        } else {
+            let mut sub =
+                |rng: &mut TestRng| random_ast(rng, leaves, max_rotation, mul, depth - 1, pool);
+            match rng.below(if mul { 6 } else { 5 }) {
+                0 => Ast::Add(Arc::new(sub(rng)), Arc::new(sub(rng))),
+                1 => -sub(rng),
+                2 => sub(rng) - sub(rng),
+                3 => Ast::Scale(Arc::new(sub(rng)), rng.scalar()),
+                4 => {
+                    let terms = (0..rng.below(4)).map(|_| sub(rng)).collect::<Vec<_>>();
+                    Ast::distribute_powers(terms, rng.scalar())
+                }
+                _ => Ast::Mul(AstMul(Arc::new(sub(rng)), Arc::new(sub(rng)))),
+            }
+        };
+        pool.push(ast.clone());
+        ast
+    }
+
+    /// Evaluates `ast` at a single index, directly from the definitions of the operations.
+    fn naive_eval<E, B: BasisOps>(
+        ast: &Ast<E, pallas::Base, B>,
+        polys: &[Polynomial<pallas::Base, B>],
+        domain: &EvaluationDomain<pallas::Base>,
+        row: usize,
+    ) -> pallas::Base {
+        let len = polys[0].len();
+        match ast {
+            Ast::Poly(leaf) => {
+                let shift = leaf.rotation.0 as i64 * B::rotation_scale(domain).unwrap_or(0) as i64;
+                polys[leaf.index][(row as i64 + shift).rem_euclid(len as i64) as usize]
+            }
+            Ast::Add(a, b) => naive_eval(a, polys, domain, row) + naive_eval(b, polys, domain, row),
+            Ast::Mul(AstMul(a, b)) => {
+                naive_eval(a, polys, domain, row) * naive_eval(b, polys, domain, row)
+            }
+            Ast::Scale(a, c) => naive_eval(a, polys, domain, row) * c,
+            Ast::DistributePowers(terms, base) => {
+                terms.iter().fold(pallas::Base::ZERO, |acc, t| {
+                    acc * base + naive_eval(t, polys, domain, row)
+                })
+            }
+            // Use the recursive evaluator's whole-polynomial terms as the definitions.
+            Ast::LinearTerm(c) => B::linear_term(domain, len, len, 0, *c)[row],
+            Ast::ConstantTerm(c) => B::constant_term(len, len, 0, *c)[row],
+        }
+    }
+
+    /// Checks that the compiled evaluator agrees with a direct evaluation (and, where it
+    /// supports the expression, with the recursive evaluator) on random expressions, for
+    /// every chunk size on small domains.
+    ///
+    /// `lagrange` selects whether `B` is one of the Lagrange bases, which support rotations
+    /// and multiplication.
+    fn check_random_expressions<B: BasisOps>(lagrange: bool) {
+        let mut rng = TestRng(0x5eed_1234_5678_9abc);
+        for (j, k) in [(1, 1), (3, 1), (3, 2), (5, 2), (4, 3), (9, 4)] {
+            let domain = EvaluationDomain::<pallas::Base>::new(j, k);
+            let mut evaluator = new_evaluator::<_, _, B>(|| {});
+            let leaves: Vec<_> = (0..3)
+                .map(|_| {
+                    let mut poly = B::empty_poly(&domain);
+                    for value in poly.iter_mut() {
+                        *value = pallas::Base::from(rng.next());
+                    }
+                    evaluator.register_poly(poly)
+                })
+                .collect();
+            let poly_len = evaluator.polys[0].len();
+
+            for _ in 0..40 {
+                let mut pool = vec![];
+                let depth = 1 + rng.below(4);
+                // The evaluator does not support rotating by more than the domain size.
+                let max_rotation = if lagrange { 3.min((1 << k) - 1) } else { 0 };
+                let ast = random_ast(&mut rng, &leaves, max_rotation, lagrange, depth, &mut pool);
+
+                let expected: Vec<_> = (0..poly_len)
+                    .map(|row| naive_eval(&ast, &evaluator.polys, &domain, row))
+                    .collect();
+                assert_eq!(evaluator.evaluate(&ast, &domain).values, expected);
+                // The recursive evaluator cannot read polynomials in the coefficient basis.
+                if lagrange {
+                    assert_eq!(evaluator.evaluate_recursive(&ast, &domain).values, expected);
+                }
+
+                let program = Program::compile(&ast, poly_len, B::rotation_scale(&domain));
+                for chunk_size in 1..=poly_len {
+                    let actual: Polynomial<_, B> =
+                        program.evaluate_in_chunks(&evaluator.polys, &domain, chunk_size);
+                    assert_eq!(actual.values, expected, "chunk size {}", chunk_size);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compiled_matches_reference_coeff() {
+        check_random_expressions::<Coeff>(false);
+    }
+
+    #[test]
+    fn compiled_matches_reference_lagrange() {
+        check_random_expressions::<LagrangeCoeff>(true);
+    }
+
+    #[test]
+    fn compiled_matches_reference_extended() {
+        check_random_expressions::<ExtendedLagrangeCoeff>(true);
+    }
+
+    #[test]
+    fn compiler_deduplicates_and_simplifies() {
+        let domain = EvaluationDomain::<pallas::Base>::new(3, 3);
+        let mut evaluator = new_evaluator::<_, _, ExtendedLagrangeCoeff>(|| {});
+        let a = evaluator.register_poly(domain.constant_extended(pallas::Base::from(3)));
+        let b = evaluator.register_poly(domain.constant_extended(pallas::Base::from(5)));
+        let poly_len = domain.extended_len();
+        let compile = |ast: &Ast<_, _, _>| {
+            Program::compile(
+                ast,
+                poly_len,
+                ExtendedLagrangeCoeff::rotation_scale(&domain),
+            )
+            .num_instrs()
+        };
+
+        // Separately constructed copies of the same product are evaluated once.
+        let ab = || Ast::from(a) * Ast::from(b);
+        assert_eq!(compile(&(ab() + ab())), 2);
+        assert_eq!(compile(&(ab() * ab())), 2);
+
+        // Scaling by zero, one and minus one, adding zero, and the leading zero step of a
+        // Horner chain need no instructions of their own.
+        let x = Ast::from(a);
+        assert_eq!(compile(&(x.clone() * pallas::Base::ONE)), 0);
+        assert_eq!(compile(&(x.clone() * pallas::Base::ZERO)), 0);
+        assert_eq!(
+            compile(&(Ast::ConstantTerm(pallas::Base::ZERO) + x.clone())),
+            0
+        );
+        assert_eq!(
+            compile(&(x.clone() + (-(Ast::from(b) * -pallas::Base::ONE)))),
+            1
+        );
+        assert_eq!(
+            compile(&Ast::distribute_powers(
+                [x.clone(), Ast::from(b)],
+                pallas::Base::from(7)
+            )),
+            1
+        );
+        // A product with a constant polynomial is a scale.
+        assert_eq!(compile(&(x * Ast::ConstantTerm(pallas::Base::from(2)))), 1);
+    }
+
+    #[test]
+    fn coeff_linear_term_short_chunks() {
+        // With one coefficient per chunk, the linear coefficient is the whole second
+        // chunk. This used to index past the end of the first chunk.
+        let domain = EvaluationDomain::<pallas::Base>::new(1, 1);
+        let s = pallas::Base::from(9);
+        assert_eq!(
+            Coeff::linear_term(&domain, 2, 1, 0, s),
+            vec![pallas::Base::ZERO]
+        );
+        assert_eq!(Coeff::linear_term(&domain, 2, 1, 1, s), vec![s]);
+        assert_eq!(
+            Coeff::linear_term(&domain, 2, 2, 0, s),
+            vec![pallas::Base::ZERO, s]
+        );
     }
 }

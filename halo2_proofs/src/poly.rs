@@ -218,6 +218,7 @@ impl<F: Field> Polynomial<F, LagrangeCoeff> {
     ///     .unwrap()
     ///     .to_vec()
     /// ```
+    #[cfg(test)]
     pub(crate) fn get_chunk_of_rotated(
         &self,
         rotation: Rotation,
@@ -234,6 +235,7 @@ impl<F: Field> Polynomial<F, LagrangeCoeff> {
 }
 
 impl<F: Clone + Copy, B> Polynomial<F, B> {
+    #[cfg(test)]
     pub(crate) fn get_chunk_of_rotated_helper(
         &self,
         rotation_is_negative: bool,
