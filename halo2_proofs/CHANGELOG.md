@@ -6,6 +6,19 @@ and this project adheres to Rust's notion of
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- `halo2_proofs::plonk::create_proof` now synthesizes the witnesses of all
+  circuits concurrently (when the `multicore` feature is enabled) before
+  blinding and committing to them. Randomness is drawn and the transcript is
+  written in the same order as before, so for a given RNG the proof bytes are
+  unchanged.
+- `halo2_proofs::plonk::create_proof` now has additional trait bounds:
+  - `ConcreteCircuit: Sync`
+  - `ConcreteCircuit::Config: Send`
+
+  These bounds apply regardless of whether the `multicore` feature is enabled.
+  Circuits whose witness or configuration types contain non-thread-safe types
+  (such as `Rc` or `RefCell`) can no longer be proven with `create_proof`.
 
 ## [0.3.2] - 2025-12-04
 ### Added

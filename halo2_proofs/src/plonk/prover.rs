@@ -24,9 +24,13 @@ use crate::{
     },
 };
 use crate::{
+    multicore::IntoParallelIterator,
     poly::batch_invert_assigned,
     transcript::{EncodedChallenge, TranscriptWrite},
 };
+
+#[cfg(feature = "multicore")]
+use crate::multicore::{IndexedParallelIterator, ParallelIterator};
 
 /// This creates a proof for the provided `circuit` when given the public
 /// parameters `params` and the proving key [`ProvingKey`] that was
@@ -37,7 +41,7 @@ pub fn create_proof<
     E: EncodedChallenge<C>,
     R: RngCore,
     T: TranscriptWrite<C, E>,
-    ConcreteCircuit: Circuit<C::Scalar>,
+    ConcreteCircuit: Circuit<C::ScalarExt> + Sync,
 >(
     params: &Params<C>,
     pk: &ProvingKey<C>,
@@ -45,7 +49,10 @@ pub fn create_proof<
     instances: &[&[&[C::Scalar]]],
     mut rng: R,
     transcript: &mut T,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    ConcreteCircuit::Config: Send,
+{
     if circuits.len() != instances.len() {
         return Err(Error::InvalidInstances);
     }
@@ -132,10 +139,19 @@ pub fn create_proof<
         pub advice_blinds: Vec<Blind<C::Scalar>>,
     }
 
-    let advice: Vec<AdviceSingle<C>> = circuits
-        .iter()
-        .zip(instances.iter())
-        .map(|(circuit, instances)| -> Result<AdviceSingle<C>, Error> {
+    let unusable_rows_start = params.n as usize - (meta.blinding_factors() + 1);
+
+    // Synthesize the witness of every circuit up front. Witness synthesis draws
+    // no randomness and does not touch the transcript, so it can run for all
+    // circuits concurrently. Everything that does consume randomness or write to
+    // the transcript (blinding, commitments) happens below in the original
+    // per-circuit order, so for a given `rng` the proof is byte-for-byte the
+    // same as with serial synthesis.
+    let witnesses: Vec<_> = circuits
+        .into_par_iter()
+        .zip(instances.into_par_iter())
+        .zip(vec![config; circuits.len()].into_par_iter())
+        .map(|((circuit, instances), config)| -> Result<_, Error> {
             struct WitnessCollection<'a, F: Field> {
                 k: u32,
                 pub advice: Vec<Polynomial<Assigned<F>, LagrangeCoeff>>,
@@ -266,8 +282,6 @@ pub fn create_proof<
                 }
             }
 
-            let unusable_rows_start = params.n as usize - (meta.blinding_factors() + 1);
-
             let mut witness = WitnessCollection {
                 k: params.k,
                 advice: vec![domain.empty_lagrange_assigned(); meta.num_advice_columns],
@@ -284,11 +298,19 @@ pub fn create_proof<
             ConcreteCircuit::FloorPlanner::synthesize(
                 &mut witness,
                 circuit,
-                config.clone(),
+                config,
                 meta.constants.clone(),
             )?;
 
-            let mut advice = batch_invert_assigned(witness.advice);
+            Ok(batch_invert_assigned(witness.advice))
+        })
+        .collect();
+
+    let advice: Vec<AdviceSingle<C>> = witnesses
+        .into_iter()
+        .map(|advice| -> Result<AdviceSingle<C>, Error> {
+            // Errors are reported for the first failing circuit, as before.
+            let mut advice = advice?;
 
             // Add blinding factors to advice columns
             for advice in &mut advice {
