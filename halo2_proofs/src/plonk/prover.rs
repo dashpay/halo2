@@ -141,17 +141,39 @@ where
 
     let unusable_rows_start = params.n as usize - (meta.blinding_factors() + 1);
 
-    // Synthesize the witness of every circuit up front. Witness synthesis draws
-    // no randomness and does not touch the transcript, so it can run for all
-    // circuits concurrently. Everything that does consume randomness or write to
-    // the transcript (blinding, commitments) happens below in the original
-    // per-circuit order, so for a given `rng` the proof is byte-for-byte the
-    // same as with serial synthesis.
-    let witnesses: Vec<_> = circuits
+    // Draw the randomness that blinds the advice columns of every circuit up front,
+    // in the order in which it has always been drawn: for each circuit, the blinding
+    // rows of each advice column, then the blinds of the advice commitments.
+    let advice_randomness: Vec<_> = circuits
+        .iter()
+        .map(|_| {
+            let blinding_rows: Vec<Vec<C::Scalar>> = (0..meta.num_advice_columns)
+                .map(|_| {
+                    (unusable_rows_start..params.n as usize)
+                        .map(|_| C::Scalar::random(&mut rng))
+                        .collect()
+                })
+                .collect();
+            let advice_blinds: Vec<_> = (0..meta.num_advice_columns)
+                .map(|_| Blind(C::Scalar::random(&mut rng)))
+                .collect();
+            (blinding_rows, advice_blinds)
+        })
+        .collect();
+
+    // Synthesize, blind and commit to the witness of every circuit. None of this
+    // draws randomness or touches the transcript, so it runs for all circuits
+    // concurrently; the commitments are written to the transcript afterwards in
+    // circuit order. For a given `rng` the proof is therefore byte-for-byte the
+    // same as when the circuits are processed one after another.
+    let advice: Vec<_> = circuits
         .into_par_iter()
         .zip(instances.into_par_iter())
         .zip(vec![config; circuits.len()].into_par_iter())
-        .map(|((circuit, instances), config)| -> Result<_, Error> {
+        .zip(advice_randomness.into_par_iter())
+        .map(|(((circuit, instances), config), randomness)| {
+            let (blinding_rows, advice_blinds) = randomness;
+
             struct WitnessCollection<'a, F: Field> {
                 k: u32,
                 pub advice: Vec<Polynomial<Assigned<F>, LagrangeCoeff>>,
@@ -302,59 +324,53 @@ where
                 meta.constants.clone(),
             )?;
 
-            Ok(batch_invert_assigned(witness.advice))
-        })
-        .collect();
-
-    let advice: Vec<AdviceSingle<C>> = witnesses
-        .into_iter()
-        .map(|advice| -> Result<AdviceSingle<C>, Error> {
-            // Errors are reported for the first failing circuit, as before.
-            let mut advice = advice?;
+            let mut advice = batch_invert_assigned(witness.advice);
 
             // Add blinding factors to advice columns
-            for advice in &mut advice {
-                for cell in &mut advice[unusable_rows_start..] {
-                    *cell = C::Scalar::random(&mut rng);
-                }
+            for (advice, blinding_rows) in advice.iter_mut().zip(blinding_rows) {
+                advice[unusable_rows_start..].copy_from_slice(&blinding_rows);
             }
 
             // Compute commitments to advice column polynomials
-            let advice_blinds: Vec<_> = advice
-                .iter()
-                .map(|_| Blind(C::Scalar::random(&mut rng)))
-                .collect();
-            let advice_commitments_projective: Vec<_> = advice
-                .iter()
-                .zip(advice_blinds.iter())
+            let advice_commitments_projective: Vec<_> = (&advice)
+                .into_par_iter()
+                .zip((&advice_blinds).into_par_iter())
                 .map(|(poly, blind)| params.commit_lagrange(poly, *blind))
                 .collect();
             let mut advice_commitments = vec![C::identity(); advice_commitments_projective.len()];
             C::Curve::batch_normalize(&advice_commitments_projective, &mut advice_commitments);
-            let advice_commitments = advice_commitments;
             drop(advice_commitments_projective);
-
-            for commitment in &advice_commitments {
-                transcript.write_point(*commitment)?;
-            }
 
             let advice_polys: Vec<_> = advice
                 .clone()
-                .into_iter()
+                .into_par_iter()
                 .map(|poly| domain.lagrange_to_coeff(poly))
                 .collect();
 
-            let advice_cosets: Vec<_> = advice_polys
-                .iter()
+            let advice_cosets: Vec<_> = (&advice_polys)
+                .into_par_iter()
                 .map(|poly| domain.coeff_to_extended(poly.clone()))
                 .collect();
 
-            Ok(AdviceSingle {
+            let advice = AdviceSingle {
                 advice_values: advice,
                 advice_polys,
                 advice_cosets,
                 advice_blinds,
-            })
+            };
+            Ok::<_, Error>((advice, advice_commitments))
+        })
+        .collect();
+
+    let advice: Vec<AdviceSingle<C>> = advice
+        .into_iter()
+        .map(|advice| -> Result<_, Error> {
+            // Errors are reported for the first failing circuit, as before.
+            let (advice, advice_commitments) = advice?;
+            for commitment in &advice_commitments {
+                transcript.write_point(*commitment)?;
+            }
+            Ok(advice)
         })
         .collect::<Result<Vec<_>, _>>()?;
 
