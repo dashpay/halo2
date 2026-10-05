@@ -34,7 +34,7 @@ impl Proof {
         circuit: C,
     ) -> Result<Self, plonk::Error>
     where
-        C: Circuit<pallas::Base>,
+        C: Circuit<pallas::Base> + Sync,
     {
         let pk = plonk::keygen_pk(params, vk.clone(), &circuit).unwrap();
 
@@ -65,7 +65,7 @@ impl Proof {
 /// Test the generated vk and the generated proof against the stored vk and the stored proof.
 ///
 /// If the env variable GEN_ENV_VAR is set, save `vk` and `proof` into a file.
-pub(crate) fn test_against_stored_circuit<C: Circuit<pallas::Base>>(
+pub(crate) fn test_against_stored_circuit<C: Circuit<pallas::Base> + Sync>(
     circuit: C,
     circuit_name: &str,
     expected_proof_size: usize,

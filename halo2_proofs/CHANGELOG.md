@@ -30,6 +30,20 @@ and this project adheres to Rust's notion of
   compressing lookup expressions) now compiles each expression into a de-duplicated
   register program, simplifies it using exact identities on its shape and public
   constants, and evaluates it four rows per instruction. Proofs are unchanged.
+- `halo2_proofs::plonk::create_proof` now processes the circuits of a
+  multi-circuit proof concurrently (when the `multicore` feature is enabled):
+  witness synthesis, advice blinding and commitments, the lookup arguments'
+  permuted and grand-product commitments, and the permutation argument's
+  grand-product commitments (with their FFTs) run for all circuits at once.
+  Randomness is drawn and the transcript is written in the same order as
+  before, so for a given RNG the proof bytes are unchanged.
+- `halo2_proofs::plonk::create_proof` now requires `ConcreteCircuit: Sync`,
+  regardless of whether the `multicore` feature is enabled. Circuits containing
+  non-thread-safe types (such as `Rc` or `RefCell`) can no longer be proven with
+  `create_proof`. `Circuit::configure` is now called once per circuit (on the
+  thread that synthesizes it) instead of once per proof, so it must keep
+  returning the same configuration for a fresh `ConstraintSystem` (as key
+  generation already assumes).
 
 ## [0.3.2] - 2025-12-04
 ### Added
